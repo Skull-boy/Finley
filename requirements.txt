@@ -1,0 +1,43 @@
+# ─── Web Framework ───────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# ─── Telegram Bot ────────────────────────────────────────────────────────────
+python-telegram-bot==21.6
+
+# ─── Google Generative AI (Gemini) ───────────────────────────────────────────
+google-generativeai==0.7.2
+
+# ─── Database ────────────────────────────────────────────────────────────────
+motor==3.5.0               # Async MongoDB driver
+pymongo==4.8.0             # Sync MongoDB (for APScheduler)
+
+# ─── Vector Database ─────────────────────────────────────────────────────────
+qdrant-client==1.9.2
+
+# ─── Financial Data ──────────────────────────────────────────────────────────
+yfinance==0.2.40
+pandas==2.2.2
+
+# ─── Background Jobs ─────────────────────────────────────────────────────────
+APScheduler==3.10.4
+pytz==2024.1
+
+# ─── Google APIs (Gmail, Calendar) ───────────────────────────────────────────
+google-auth==2.30.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.133.0
+
+# ─── HTTP + Async ────────────────────────────────────────────────────────────
+httpx==0.27.0
+aiofiles==23.2.1
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+pydantic-settings==2.3.1
+pydantic==2.7.3
+python-dotenv==1.0.1
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+python-multipart==0.0.9
+tenacity==8.3.0
