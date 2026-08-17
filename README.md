@@ -83,32 +83,6 @@ hackathon/
     └── alerts.py             # Price alert monitor
 ```
 
----
-
-## 🌐 Deploy to Render.com (Free, Always-On)
-
-### Step 1: Push to GitHub
-```bash
-git init && git add . && git commit -m "Initial commit"
-git remote add origin <your-github-url>
-git push -u origin main
-```
-
-### Step 2: Create Render Service
-1. Go to [render.com](https://render.com) → New → Web Service
-2. Connect your GitHub repo
-3. Render auto-detects `render.yaml` — click **Deploy**
-
-### Step 3: Add Environment Variables
-In Render Dashboard → Environment → Add all variables from `.env.example`
-
-### Step 4: Keep-Alive with UptimeRobot
-1. Go to [uptimerobot.com](https://uptimerobot.com) (free)
-2. Add monitor: `https://your-app.onrender.com/health`
-3. Set interval: **5 minutes**
-4. Your bot now runs 24/7 without sleeping 🎉
-
----
 
 ## 🧠 Architecture Highlights
 
