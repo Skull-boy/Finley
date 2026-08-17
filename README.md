@@ -5,6 +5,8 @@
 Built with Gemini 1.5 Flash, multi-key API rotation, semantic memory, and real-time financial data.
 
 ---
+[![Finley: Your AI Financial Co-Pilot for Telegram](https://repoclip.io/api/badge/7e3f4714-2259-4daa-a32e-f7aff6dfa4ee)](https://repoclip.io/v/7e3f4714-2259-4daa-a32e-f7aff6dfa4ee)
+
 
 ## 🚀 Quick Setup
 
