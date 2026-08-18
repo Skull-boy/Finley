@@ -2,41 +2,52 @@
 
 > An AI-powered financial co-pilot that lives inside Telegram.
 
-Built with Gemini 1.5 Flash, multi-key API rotation, semantic memory, and real-time financial data.
+Built with Google Gemini (free tier), multi-key API rotation, semantic memory, and real-time financial data.
 
 ---
 
-## 🚀 Quick Setup
+## 🚀 Quick Setup (Local)
 
 ### 1. Clone & Install
 ```bash
 git clone <your-repo>
 cd hackathon
-python -m venv venv
-venv\Scripts\activate          # Windows
-pip install -r requirements.txt
+python -m venv finley
+finley\Scripts\activate          # Windows (macOS/Linux: source finley/bin/activate)
+pip install -r requirements-local.txt   # free-tier friendly pins
 ```
 
-### 2. Configure Environment
+### 2. Start the Local Databases (Docker)
+```bash
+docker compose up -d        # MongoDB (27017) + Qdrant (6333/6334)
+```
+
+### 3. Configure Environment
 ```bash
 cp .env.example .env
 # Edit .env with your API keys (see below for where to get them)
 ```
 
-### 3. API Keys You Need (All Free, No Credit Card)
+### 4. Run
+```bash
+python main.py
+# Bot polls Telegram; FastAPI serves /health on :8000
+```
+
+---
+
+## 🔑 API Keys You Need (All Free, No Credit Card)
 
 | Service | URL | Free Tier |
 |---------|-----|-----------|
 | **Telegram Bot Token** | [@BotFather](https://t.me/BotFather) | Free |
-| **Gemini API Key** (×3) | [aistudio.google.com](https://aistudio.google.com/app/apikey) | 1,500 req/day each |
-| **MongoDB Atlas** | [mongodb.com/atlas](https://www.mongodb.com/atlas) | 512MB free |
-| **Qdrant Cloud** | [cloud.qdrant.io](https://cloud.qdrant.io) | 1GB free |
+| **Gemini API Key** (×2–3, one per Google account) | [aistudio.google.com](https://aistudio.google.com/app/apikey) | ~20 generate calls/day/model per project* |
+| **MongoDB** (local Docker) | `docker compose up -d` | Free |
+| **Qdrant** (local Docker) | `docker compose up -d` | Free |
 | **Finnhub** | [finnhub.io](https://finnhub.io) | 60 calls/min free |
 
-### 4. Run Locally
-```bash
-python main.py
-```
+\* Gemini free-tier limits vary per model and change over time — check your
+usage at https://ai.dev/rate-limit. Multi-key rotation multiplies your quota.
 
 ---
 
@@ -46,11 +57,15 @@ python main.py
 hackathon/
 ├── main.py                   # FastAPI + Telegram bot entry point
 ├── config.py                 # Pydantic settings (loads from .env)
-├── requirements.txt
+├── docker-compose.yml        # Local MongoDB + Qdrant stack
+├── requirements.txt          # Runtime deps (cloud deploy)
+├── requirements-local.txt    # Runtime deps (local, free-tier pins)
+├── requirements-dev.txt      # + test deps (pytest)
 │
 ├── ai/
-│   ├── gateway.py            # Multi-key Gemini API gateway (3x quota)
-│   ├── agent.py              # Main AI orchestrator
+│   ├── gateway.py            # Multi-key Gemini gateway: retries, rotation,
+│   │                         #   embeddings, files API (google-genai SDK)
+│   ├── agent.py              # Main AI orchestrator (tool-gating by intent)
 │   ├── prompts.py            # System prompts (analyst, onboarding, briefing)
 │   ├── memory.py             # Semantic memory (Qdrant + MongoDB fallback)
 │   └── tools.py              # Gemini function-calling tool definitions
@@ -77,11 +92,28 @@ hackathon/
 │       ├── gmail.py          # Gmail OAuth + search
 │       └── calendar_service.py  # Google Calendar events
 │
-└── jobs/
-    ├── scheduler.py          # APScheduler setup
-    ├── briefings.py          # Morning briefing generator
-    └── alerts.py             # Price alert monitor
+├── jobs/
+│   ├── scheduler.py          # APScheduler setup (briefings, alerts, keepalive)
+│   ├── briefings.py          # Morning briefing generator (per-user timezone)
+│   └── alerts.py             # Price alert monitor (DST-safe market hours)
+│
+└── tests/                    # Offline test suite (no API keys needed)
+    ├── test_gateway.py       # Retry/rotation behavior (mocked)
+    ├── test_agent.py         # Tool-gating heuristics
+    └── test_formatters.py    # Telegram HTML formatting
 ```
+
+---
+
+## ✅ Running Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+All tests are offline (mocked) — they run in CI on every push/PR via
+`.github/workflows/ci.yml`, with no API keys or databases required.
 
 ---
 
@@ -89,7 +121,6 @@ hackathon/
 
 ### Step 1: Push to GitHub
 ```bash
-git init && git add . && git commit -m "Initial commit"
 git remote add origin <your-github-url>
 git push -u origin main
 ```
@@ -100,7 +131,8 @@ git push -u origin main
 3. Render auto-detects `render.yaml` — click **Deploy**
 
 ### Step 3: Add Environment Variables
-In Render Dashboard → Environment → Add all variables from `.env.example`
+In Render Dashboard → Environment → add all variables from `.env.example`
+(use MongoDB Atlas + Qdrant Cloud URLs in production).
 
 ### Step 4: Keep-Alive with UptimeRobot
 1. Go to [uptimerobot.com](https://uptimerobot.com) (free)
@@ -122,13 +154,18 @@ In Render Dashboard → Environment → Add all variables from `.env.example`
 | Voice | Not supported | Gemini native audio |
 | Documents | Not supported | Gemini Files API |
 | SEC Filings | Not supported | EDGAR direct API |
-| Cost | Same | 3x quota via multi-key rotation |
+| Cost | Same | Multi-key rotation multiplies free quota |
 
 ### Multi-Key Gemini Gateway
-Using 3 different Google accounts × 1,500 RPD each = **4,500 requests/day** free. The gateway automatically rotates keys on rate limit and puts exhausted keys on a 65-second cooldown.
+The gateway uses one key per Google account. When a key hits a rate limit
+(429) it's put on a 65-second cooldown and the next key is tried; transient
+5xx errors are retried with backoff. With 3 keys from 3 accounts you get
+3× the free quota.
 
 ### Semantic Memory
-Every conversation is analyzed by Gemini to extract memorable facts → embedded → stored in Qdrant. Future queries are semantically matched to relevant memories, making Finley feel like it actually knows the user.
+Every conversation is analyzed by Gemini to extract memorable facts →
+embedded → stored in Qdrant. Future queries are semantically matched to
+relevant memories, making Finley feel like it actually knows the user.
 
 ---
 
@@ -149,7 +186,7 @@ Every conversation is analyzed by Gemini to extract memorable facts → embedded
 **Personal Finance Intelligence**
 - Watchlist with live prices
 - Smart price alerts (above/below thresholds)
-- Personalized morning briefings at custom times
+- Personalized morning briefings at custom times (per-user timezone)
 
 **Multimodal**
 - Voice messages → transcribed → answered
@@ -169,9 +206,12 @@ Every conversation is analyzed by Gemini to extract memorable facts → embedded
 uvicorn main:app --reload --port 8000
 
 # Local databases (Docker)
-docker-compose up -d
+docker compose up -d
 
-# Check health
+# API docs (development only)
+open http://localhost:8000/docs
+
+# Health check
 curl http://localhost:8000/health
 ```
 
