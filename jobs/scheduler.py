@@ -31,11 +31,12 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     )
 
     # ── Price alerts ──────────────────────────────────────────────────────────
-    # Every 5 minutes during market hours (7am-5pm UTC to cover pre/post market)
+    # Every 5 minutes, all day — the job itself checks US market hours
+    # (DST-aware via America/New_York) so the schedule never drifts.
     from jobs.alerts import check_price_alerts
     _scheduler.add_job(
         check_price_alerts,
-        trigger=CronTrigger(minute="*/5", hour="13-21"),  # 13-21 UTC = 9am-5pm EST
+        trigger=IntervalTrigger(minutes=5),
         args=[bot],
         id="price_alerts",
         name="Price Alerts",
