@@ -55,6 +55,7 @@ def new_user(telegram_id: int, username: str = "", first_name: str = "") -> Dict
         },
         "created_at": datetime.utcnow(),
         "last_active": datetime.utcnow(),
+        "last_briefing_sent": None,  # ISO timestamp — prevents double briefings
     }
 
 

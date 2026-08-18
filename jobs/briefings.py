@@ -15,7 +15,7 @@ from telegram.constants import ParseMode
 
 from ai.gateway import get_gateway
 from ai.prompts import BRIEFING_SYSTEM_PROMPT
-from db.crud import get_all_users_with_briefing
+from db.crud import get_all_users_with_briefing, update_user
 from services.financial.market import get_market_summary, get_stock_quote
 from services.financial.earnings import get_earnings_calendar
 from services.financial.news import get_market_news
@@ -66,6 +66,17 @@ async def send_morning_briefings(bot: Bot) -> None:
             if abs(user_total_min - target_total_min) > 5:
                 continue
 
+            # Skip if a briefing was already sent recently (job runs every 5 min —
+            # without this guard a user at :03 gets double briefings at :00 and :05)
+            last_sent = user.get("last_briefing_sent")
+            if last_sent:
+                try:
+                    last_dt = datetime.fromisoformat(str(last_sent))
+                    if (datetime.utcnow() - last_dt).total_seconds() < 600:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
             # Generate and send briefing
             briefing = await _generate_briefing(user)
             if briefing:
@@ -74,6 +85,9 @@ async def send_morning_briefings(bot: Bot) -> None:
                     text=briefing,
                     parse_mode=ParseMode.HTML
                 )
+                await update_user(user["telegram_id"], {
+                    "last_briefing_sent": datetime.utcnow().isoformat()
+                })
 
         except Exception:
             continue  # Never crash the whole job for one user
