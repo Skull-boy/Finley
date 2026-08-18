@@ -46,7 +46,7 @@ class Settings(BaseSettings):
 
     # ─── Bot ─────────────────────────────────────────────────────────────────
     bot_name: str = "Finley"
-    bot_max_history: int = 20
+    bot_max_history: int = 12
     bot_max_memory_results: int = 5
 
     @property

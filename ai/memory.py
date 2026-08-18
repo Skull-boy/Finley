@@ -54,22 +54,27 @@ Update the profile summary to incorporate the new facts. Keep it under 200 words
 Write in third person. Focus on: role, interests, watchlist preferences, communication style.
 Return ONLY the updated summary text."""
 
+    # Extraction is throttled: every Nth turn only, to protect free-tier quota
+    # (each extraction costs 1 LLM call + 2 embeddings + a summary rewrite).
+    EXTRACTION_INTERVAL_TURNS = 5
+
     def __init__(self):
         self._qdrant_client = None
         self._collection_name = "finbot_memories"
         self._qdrant_ready = False
+        self._extraction_counts: Dict[int, int] = {}
         self._setup_qdrant()
 
     def _setup_qdrant(self):
         """Initialize Qdrant client if configured."""
-        if settings.qdrant_url and settings.qdrant_api_key:
+        if settings.qdrant_url:
             try:
                 from qdrant_client import QdrantClient
-                self._qdrant_client = QdrantClient(
-                    url=settings.qdrant_url,
-                    api_key=settings.qdrant_api_key,
-                    timeout=10
-                )
+                client_kwargs = {"url": settings.qdrant_url, "timeout": 10}
+                if settings.qdrant_api_key:
+                    client_kwargs["api_key"] = settings.qdrant_api_key
+                client_kwargs["check_compatibility"] = False
+                self._qdrant_client = QdrantClient(**client_kwargs)
                 self._qdrant_ready = True
             except Exception:
                 self._qdrant_ready = False
@@ -99,6 +104,11 @@ Return ONLY the updated summary text."""
         Called asynchronously after each conversation turn — doesn't block responses.
         """
         if len(conversation) < 2:
+            return
+
+        # Throttle: only extract every N turns per user (quota protection)
+        self._extraction_counts[user_id] = self._extraction_counts.get(user_id, 0) + 1
+        if self._extraction_counts[user_id] % self.EXTRACTION_INTERVAL_TURNS != 0:
             return
 
         gateway = get_gateway()
@@ -201,13 +211,13 @@ Return ONLY the updated summary text."""
             )
 
             results = await asyncio.to_thread(
-                self._qdrant_client.search,
+                self._qdrant_client.query_points,
                 collection_name=self._collection_name,
-                query_vector=query_embedding,
+                query=query_embedding,
                 query_filter=search_filter,
                 limit=limit
             )
-            return [r.payload["fact"] for r in results if r.score > 0.5]
+            return [r.payload["fact"] for r in results.points if r.score > 0.5]
         except Exception:
             return await self._mongodb_fallback_search(user_id, limit)
 

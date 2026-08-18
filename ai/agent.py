@@ -11,8 +11,40 @@ from typing import Dict, Any, List, Optional
 from ai.gateway import get_gateway
 from ai.prompts import build_analyst_prompt
 from ai.memory import get_memory_manager
-from ai.tools import FINANCIAL_TOOLS, set_current_user
+from ai.tools import FINANCIAL_TOOLS
 from db.crud import get_recent_history, save_message, get_user
+from config import settings
+
+
+# ─── Tool-gating heuristics ───────────────────────────────────────────────────
+
+_TOOL_KEYWORDS = re.compile(
+    r"(?:\$[A-Za-z]{1,5}\b|"
+    r"\b(?:price|quote|quotes|stock|stocks|shares|share price|portfolio|watchlist|alert|alerts|"
+    r"earnings|news|dividend|revenue|financials|income statement|balance sheet|cash flow|buy|sell|"
+    r"position|positions|holdings|etf|etfs|fund|funds|index|indices|market|markets|crypto|bitcoin|"
+    r"ethereum|btc|eth|valuation|pe ratio|profit|loss|gains|ticker|company|companies|nasdaq|nyse|"
+    r"sp500|s&p|sector|annual report|quarterly)\b)",
+    re.IGNORECASE,
+)
+
+_COMMON_UPPER_WORDS = {
+    "US", "USA", "UK", "EU", "AI", "OK", "CEO", "CFO", "CTO", "ASAP", "FYI",
+    "TV", "PC", "API", "URL", "GPS", "VPN", "IPO", "GDP", "FED", "SEC", "IRS",
+    "ROI", "KPI", "FAQ", "LOL", "IMO", "TBD", "ID", "PS", "R&D",
+}
+
+
+def _needs_tools(message: str) -> bool:
+    """True when a message plausibly needs financial tool-calling."""
+    if not message:
+        return False
+    if _TOOL_KEYWORDS.search(message):
+        return True
+    for token in re.findall(r"\b[A-Z]{2,5}\b", message):
+        if token not in _COMMON_UPPER_WORDS:
+            return True
+    return False
 
 
 class FinancialAgent:
@@ -51,18 +83,20 @@ class FinancialAgent:
         if not user:
             return "Something went wrong. Please send /start to begin."
 
-        # ── 2. Set user context for tool executor ─────────────────────────────
-        set_current_user(user_id)
-
-        # ── 3. Get relevant memories ──────────────────────────────────────────
+        # ── 2. Get relevant memories ──────────────────────────────────────────
+        # Skip for trivial short messages (greetings, thanks) to save a call
         memory_manager = get_memory_manager()
-        try:
-            relevant_memories = await memory_manager.search(user_id, content, limit=5)
-        except Exception:
-            relevant_memories = []
+        relevant_memories = []
+        if len(content.split()) >= 3 or _needs_tools(content):
+            try:
+                relevant_memories = await memory_manager.search(
+                    user_id, content, limit=settings.bot_max_memory_results
+                )
+            except Exception:
+                relevant_memories = []
 
-        # ── 4. Get recent history ─────────────────────────────────────────────
-        history = await get_recent_history(user_id, limit=20)
+        # ── 3. Get recent history ─────────────────────────────────────────────
+        history = await get_recent_history(user_id, limit=settings.bot_max_history)
         # Convert to Gemini format (exclude very long messages to save tokens)
         gemini_history = [
             {"role": msg["role"], "content": _truncate(msg["content"], 500)}
@@ -88,8 +122,9 @@ class FinancialAgent:
             prompt=augmented_content,
             system_prompt=system_prompt,
             history=gemini_history,
-            tools=FINANCIAL_TOOLS,   # Pass single Tool object (not a list — gateway handles wrapping)
+            tools=FINANCIAL_TOOLS if _needs_tools(content) else None,
             temperature=0.7,
+            user_id=user_id,
         )
 
         # ── 8. Clean up response for Telegram ────────────────────────────────
