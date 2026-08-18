@@ -4,214 +4,211 @@ Gemini Function Calling Tool Definitions + Executor.
 Tools are registered with Gemini so the AI can decide WHEN to call them.
 The AI automatically picks which tools to use based on the user's request.
 No user command needed — just natural language.
+
+Uses the new `google.genai` SDK types.
 """
 import asyncio
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-import google.generativeai as genai
+from google.genai import types
 
 
 # ─── Tool Declarations ────────────────────────────────────────────────────────
 
-def _make_tools() -> genai.protos.Tool:
+def _make_tools() -> types.Tool:
     """Build the complete set of financial tools for Gemini function calling."""
     declarations = [
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_stock_quote",
             description="Get the current real-time stock price, change percentage, and key metrics for a stock ticker symbol.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "ticker": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "ticker": types.Schema(
+                        type=types.Type.STRING,
                         description="Stock ticker symbol (e.g., AAPL, TSLA, NVDA)"
                     )
                 },
                 required=["ticker"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_company_news",
             description="Get the latest news articles for a specific company. Use when the user asks about recent events, announcements, or what's happening with a company.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "ticker": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "ticker": types.Schema(
+                        type=types.Type.STRING,
                         description="Stock ticker symbol"
                     ),
-                    "days": genai.protos.Schema(
-                        type=genai.protos.Type.INTEGER,
+                    "days": types.Schema(
+                        type=types.Type.INTEGER,
                         description="Number of days of news to retrieve (default: 7)"
                     )
                 },
                 required=["ticker"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_market_summary",
             description="Get the current market overview including major index performance (S&P 500, NASDAQ, Dow Jones). Use for 'what's happening in the market' type questions.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "placeholder": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "placeholder": types.Schema(
+                        type=types.Type.STRING,
                         description="Not used. Pass empty string."
                     )
                 }
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_company_financials",
             description="Get fundamental financial data for a company: revenue, earnings, P/E ratio, profit margins, debt levels. Use for investment analysis or company comparison.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "ticker": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "ticker": types.Schema(
+                        type=types.Type.STRING,
                         description="Stock ticker symbol"
                     )
                 },
                 required=["ticker"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_earnings_calendar",
             description="Get upcoming earnings announcements for the next N days, or for a specific company. Use when user asks about upcoming earnings reports.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "days_ahead": genai.protos.Schema(
-                        type=genai.protos.Type.INTEGER,
+                    "days_ahead": types.Schema(
+                        type=types.Type.INTEGER,
                         description="Number of days ahead to look (default: 7)"
                     ),
-                    "ticker": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "ticker": types.Schema(
+                        type=types.Type.STRING,
                         description="Specific ticker to check (optional)"
                     )
                 }
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="search_sec_filings",
             description="Search SEC EDGAR for recent regulatory filings (10-K, 10-Q, 8-K, insider transactions) for a company.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "ticker": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "ticker": types.Schema(
+                        type=types.Type.STRING,
                         description="Stock ticker symbol"
                     ),
-                    "filing_type": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "filing_type": types.Schema(
+                        type=types.Type.STRING,
                         description="Type of filing: 10-K, 10-Q, 8-K, 4 (insider). Leave empty for all recent."
                     )
                 },
                 required=["ticker"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_market_news",
             description="Get general financial market news not tied to a specific company. Use for questions about macro events, Fed, inflation, economic data.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "category": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "category": types.Schema(
+                        type=types.Type.STRING,
                         description="News category: general, forex, crypto, merger, technology"
                     )
                 }
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="add_to_watchlist",
             description="Add one or more stock tickers to the user's personal watchlist for ongoing monitoring.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "tickers": genai.protos.Schema(
-                        type=genai.protos.Type.ARRAY,
-                        items=genai.protos.Schema(type=genai.protos.Type.STRING),
+                    "tickers": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING),
                         description="List of ticker symbols to add"
                     )
                 },
                 required=["tickers"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="set_price_alert",
             description="Set a price alert for a stock. The user will be notified when the price crosses the threshold.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "ticker": genai.protos.Schema(type=genai.protos.Type.STRING, description="Ticker symbol"),
-                    "threshold": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Price threshold"),
-                    "direction": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "ticker": types.Schema(type=types.Type.STRING, description="Ticker symbol"),
+                    "threshold": types.Schema(type=types.Type.NUMBER, description="Price threshold"),
+                    "direction": types.Schema(
+                        type=types.Type.STRING,
                         description="above or below — alert when price goes above or below threshold"
                     )
                 },
                 required=["ticker", "threshold", "direction"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_watchlist_summary",
             description="Get a quick summary of the user's current watchlist including latest prices and changes.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "placeholder": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
+                    "placeholder": types.Schema(
+                        type=types.Type.STRING,
                         description="Not used. Pass empty string."
                     )
                 }
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="compare_companies",
             description="Compare two or more companies across key financial metrics: revenue growth, profitability, valuation, and analyst sentiment.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "tickers": genai.protos.Schema(
-                        type=genai.protos.Type.ARRAY,
-                        items=genai.protos.Schema(type=genai.protos.Type.STRING),
+                    "tickers": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING),
                         description="List of ticker symbols to compare (2-4 companies)"
                     )
                 },
                 required=["tickers"]
             )
         ),
-        genai.protos.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="get_analyst_ratings",
             description="Get the latest analyst ratings and price targets for a stock.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
                 properties={
-                    "ticker": genai.protos.Schema(type=genai.protos.Type.STRING, description="Ticker symbol")
+                    "ticker": types.Schema(type=types.Type.STRING, description="Ticker symbol")
                 },
                 required=["ticker"]
             )
         ),
     ]
-    return genai.protos.Tool(function_declarations=declarations)
+    return types.Tool(function_declarations=declarations)
 
 
 # ─── Tool Executor ────────────────────────────────────────────────────────────
 
-_current_user_id: Optional[int] = None
 
-
-def set_current_user(user_id: int):
-    """Set the current user context for tools that need it (watchlist, alerts)."""
-    global _current_user_id
-    _current_user_id = user_id
-
-
-async def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
+async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[int] = None) -> str:
     """
     Route a tool call to the appropriate service function.
     Returns a formatted string result that Gemini will use to generate its response.
+
+    user_id is threaded through from the request context so concurrent
+    users never share state.
     """
     try:
         if tool_name == "get_stock_quote":
@@ -246,36 +243,35 @@ async def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
             return await get_market_news(args.get("category", "general"))
 
         elif tool_name == "add_to_watchlist":
-            if _current_user_id:
+            if user_id:
                 from db.crud import add_to_watchlist
                 tickers = args.get("tickers", [])
                 if tickers:
-                    await add_to_watchlist(_current_user_id, tickers)
+                    await add_to_watchlist(user_id, tickers)
                     return f"Added {', '.join(tickers)} to your watchlist."
             return "Could not add to watchlist — user context missing."
 
         elif tool_name == "set_price_alert":
-            if _current_user_id:
+            if user_id:
                 from db.crud import create_alert
                 ticker = args["ticker"].upper()
                 threshold = float(args["threshold"])
                 direction = args["direction"]
-                description = f"{ticker} {direction} ${threshold:.2f}"
                 await create_alert(
-                    _current_user_id,
+                    user_id,
                     f"price_{direction}",
                     ticker,
                     {"threshold": threshold, "direction": direction},
-                    description
+                    f"{ticker} {direction} ${threshold:.2f}"
                 )
                 return f"Alert set: I'll notify you when {ticker} goes {direction} ${threshold:.2f}."
             return "Could not set alert — user context missing."
 
         elif tool_name == "get_watchlist_summary":
-            if _current_user_id:
+            if user_id:
                 from db.crud import get_user
                 from services.financial.market import get_stock_quote
-                user = await get_user(_current_user_id)
+                user = await get_user(user_id)
                 if not user:
                     return "Could not retrieve watchlist."
                 watchlist = user.get("profile", {}).get("watchlist", [])
@@ -303,6 +299,4 @@ async def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
 
 
 # ─── Exported Tools Object ────────────────────────────────────────────────────
-# NOTE: This is a module-level singleton. genai.protos doesn't need configure() to build Schema objects.
-
 FINANCIAL_TOOLS = _make_tools()
