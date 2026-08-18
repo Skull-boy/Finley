@@ -46,6 +46,13 @@ class GeminiGateway:
         self.cooldowns: Dict[int, float] = {}  # key_index → cooldown_until timestamp
         self._lock = asyncio.Lock()
 
+        if len(self.api_keys) < 2:
+            logger.warning(
+                "Only %d Gemini API key(s) configured. Add GEMINI_API_KEY_2/3 "
+                "from separate Google accounts for key rotation to work.",
+                len(self.api_keys),
+            )
+
     # ─── Private helpers ──────────────────────────────────────────────────────
 
     def _get_available_client(self):
