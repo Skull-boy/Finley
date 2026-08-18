@@ -3,18 +3,17 @@ SEC EDGAR filing search service.
 No API key required — direct EDGAR REST API access.
 Covers: 10-K, 10-Q, 8-K, Form 4 (insider transactions), and more.
 """
-import asyncio
 from typing import Optional, List, Dict, Any
-from datetime import datetime
 
 import httpx
 
-EDGAR_BASE = "https://efts.sec.gov"
+from config import settings
+
 SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
 
 # User-Agent required by SEC EDGAR (they block bots without it)
 HEADERS = {
-    "User-Agent": "FinBot/1.0 finbot@demo.com",
+    "User-Agent": f"Finley/1.0 {settings.sec_contact_email}",
     "Accept-Encoding": "gzip, deflate"
 }
 

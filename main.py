@@ -103,7 +103,7 @@ app = FastAPI(
     description="AI-powered financial assistant for Telegram",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url=None,  # Disable in production
+    docs_url=None if settings.is_production else "/docs",
     redoc_url=None,
 )
 
@@ -130,21 +130,27 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Landing page — shows bot status."""
-    return """
+    bot_username = "YourBotUsername"
+    if telegram_app is not None:
+        try:
+            bot_username = telegram_app.bot.username or bot_username
+        except Exception:
+            pass
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Finley — AI Financial Assistant</title>
         <style>
-            body { font-family: -apple-system, sans-serif; display: flex; justify-content: center;
-                   align-items: center; height: 100vh; margin: 0; background: #0a0e1a; color: #fff; }
-            .card { text-align: center; padding: 40px; background: #111827;
-                    border-radius: 16px; border: 1px solid #1f2937; max-width: 400px; }
-            h1 { font-size: 2rem; margin-bottom: 8px; }
-            .status { color: #10b981; font-size: 0.9rem; margin: 16px 0; }
-            a { color: #3b82f6; text-decoration: none; font-weight: 600; font-size: 1.1rem; }
-            a:hover { text-decoration: underline; }
-            .emoji { font-size: 3rem; margin-bottom: 16px; display: block; }
+            body {{ font-family: -apple-system, sans-serif; display: flex; justify-content: center;
+                   align-items: center; height: 100vh; margin: 0; background: #0a0e1a; color: #fff; }}
+            .card {{ text-align: center; padding: 40px; background: #111827;
+                    border-radius: 16px; border: 1px solid #1f2937; max-width: 400px; }}
+            h1 {{ font-size: 2rem; margin-bottom: 8px; }}
+            .status {{ color: #10b981; font-size: 0.9rem; margin: 16px 0; }}
+            a {{ color: #3b82f6; text-decoration: none; font-weight: 600; font-size: 1.1rem; }}
+            a:hover {{ text-decoration: underline; }}
+            .emoji {{ font-size: 3rem; margin-bottom: 16px; display: block; }}
         </style>
     </head>
     <body>
@@ -153,7 +159,7 @@ async def root():
             <h1>Finley</h1>
             <p>AI-Powered Financial Assistant</p>
             <p class="status">● Live and Running</p>
-            <a href="https://t.me/YourBotUsername" target="_blank">Open in Telegram →</a>
+            <a href="https://t.me/{bot_username}" target="_blank">Open in Telegram →</a>
         </div>
     </body>
     </html>

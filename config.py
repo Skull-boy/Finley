@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # ─── Finnhub ────────────────────────────────────────────────────────────
     finnhub_api_key: str
 
+    # ─── SEC EDGAR ──────────────────────────────────────────────────────────
+    # Contact email required in SEC API User-Agent header
+    sec_contact_email: str = "finbot@demo.com"
+
     # ─── Google OAuth ───────────────────────────────────────────────────────
     google_client_id: str = ""
     google_client_secret: str = ""

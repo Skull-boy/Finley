@@ -234,6 +234,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await _send_response(update, response)
 
+    except Exception:
+        await update.message.reply_text(
+            "Sorry, I couldn't process that voice message. Please try again.",
+            parse_mode=ParseMode.HTML
+        )
     finally:
         cleanup_temp_file(tmp_path)
 
@@ -285,6 +290,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         formatted = _format_for_telegram(analysis)
         await _send_response(update, formatted)
 
+    except Exception:
+        await update.message.reply_text(
+            "Sorry, I couldn't analyze that document. Please try again.",
+            parse_mode=ParseMode.HTML
+        )
     finally:
         cleanup_doc(file_path)
 
@@ -317,6 +327,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await telegram_file.download_to_drive(tmp_path)
         analysis = await analyze_image(tmp_path, user_question=caption)
         await _send_response(update, _format_for_telegram(analysis))
+    except Exception:
+        await update.message.reply_text(
+            "Sorry, I couldn't process that image. Please try again.",
+            parse_mode=ParseMode.HTML
+        )
     finally:
         cleanup_temp_file(tmp_path)
 
