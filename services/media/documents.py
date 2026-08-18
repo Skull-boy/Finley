@@ -2,15 +2,14 @@
 Document analysis service.
 Handles PDF, Excel, Word, and image uploads.
 Uses Gemini's native document understanding — no OCR library needed.
+
+Uses the shared gateway so multi-key rotation applies to media requests too.
 """
-import asyncio
 import os
 import tempfile
 from typing import Optional, Tuple
 
-import google.generativeai as genai
-
-from config import settings
+from ai.gateway import get_gateway
 
 # MIME types Gemini Files API supports
 SUPPORTED_MIME_TYPES = {
@@ -24,6 +23,24 @@ SUPPORTED_MIME_TYPES = {
     ".txt": "text/plain",
     ".csv": "text/csv",
 }
+
+_DOCUMENT_PROMPT = (
+    "You are a senior financial analyst reviewing this document. Provide:\n"
+    "1. A 2-3 sentence executive summary\n"
+    "2. The 3-5 most important financial metrics or findings\n"
+    "3. Key risks or concerns you notice\n"
+    "4. One forward-looking insight\n\n"
+    "Be specific, use actual numbers, and keep it under 300 words."
+)
+
+_IMAGE_PROMPT = (
+    "Analyze this financial chart or image. Describe:\n"
+    "• What the chart/image shows\n"
+    "• Key trends or patterns visible\n"
+    "• Any notable data points or anomalies\n"
+    "• What this might mean for investors\n"
+    "Keep it concise and actionable."
+)
 
 
 async def analyze_document(file_path: str, user_question: str = "") -> str:
@@ -43,18 +60,11 @@ async def analyze_document(file_path: str, user_question: str = "") -> str:
     if mime_type == "application/octet-stream":
         return "I can analyze PDFs, images (PNG/JPG), and CSV files. Please upload one of these formats."
 
-    api_key = settings.gemini_api_keys[0]
-    genai.configure(api_key=api_key)
+    gateway = get_gateway()
+    uploaded = None
 
     try:
-        # Upload to Gemini Files API
-        uploaded = await asyncio.to_thread(
-            genai.upload_file,
-            path=file_path,
-            mime_type=mime_type
-        )
-
-        model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        uploaded = await gateway.upload_file(file_path, mime_type)
 
         if user_question:
             prompt = (
@@ -63,30 +73,17 @@ async def analyze_document(file_path: str, user_question: str = "") -> str:
                 "Format your response clearly with bullet points for key findings."
             )
         else:
-            prompt = (
-                "You are a senior financial analyst reviewing this document. Provide:\n"
-                "1. A 2-3 sentence executive summary\n"
-                "2. The 3-5 most important financial metrics or findings\n"
-                "3. Key risks or concerns you notice\n"
-                "4. One forward-looking insight\n\n"
-                "Be specific, use actual numbers, and keep it under 300 words."
-            )
+            prompt = _DOCUMENT_PROMPT
 
-        response = await asyncio.to_thread(
-            model.generate_content,
-            [uploaded, prompt]
-        )
-
-        # Cleanup
-        try:
-            await asyncio.to_thread(uploaded.delete)
-        except Exception:
-            pass
-
-        return response.text
+        text = await gateway.generate_with_file(uploaded, prompt)
+        return text or "Could not analyze the document."
 
     except Exception as e:
         return f"Document analysis failed: {str(e)}"
+
+    finally:
+        if uploaded:
+            await gateway.delete_file(uploaded)
 
 
 async def analyze_image(file_path: str, user_question: str = "") -> str:
@@ -96,44 +93,26 @@ async def analyze_image(file_path: str, user_question: str = "") -> str:
     ext = os.path.splitext(file_path)[1].lower()
     mime_type = SUPPORTED_MIME_TYPES.get(ext, "image/jpeg")
 
-    api_key = settings.gemini_api_keys[0]
-    genai.configure(api_key=api_key)
+    gateway = get_gateway()
+    uploaded = None
 
     try:
-        uploaded = await asyncio.to_thread(
-            genai.upload_file,
-            path=file_path,
-            mime_type=mime_type
-        )
-
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        uploaded = await gateway.upload_file(file_path, mime_type)
 
         if user_question:
             prompt = f"Analyze this financial image/chart and answer: {user_question}"
         else:
-            prompt = (
-                "Analyze this financial chart or image. Describe:\n"
-                "• What the chart/image shows\n"
-                "• Key trends or patterns visible\n"
-                "• Any notable data points or anomalies\n"
-                "• What this might mean for investors\n"
-                "Keep it concise and actionable."
-            )
+            prompt = _IMAGE_PROMPT
 
-        response = await asyncio.to_thread(
-            model.generate_content,
-            [uploaded, prompt]
-        )
-
-        try:
-            await asyncio.to_thread(uploaded.delete)
-        except Exception:
-            pass
-
-        return response.text
+        text = await gateway.generate_with_file(uploaded, prompt)
+        return text or "Could not analyze the image."
 
     except Exception as e:
         return f"Image analysis failed: {str(e)}"
+
+    finally:
+        if uploaded:
+            await gateway.delete_file(uploaded)
 
 
 async def download_document(file_obj, bot, original_filename: str = "") -> Optional[Tuple[str, str]]:

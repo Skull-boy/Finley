@@ -1,71 +1,52 @@
 """
 Voice message processing service.
 Downloads Telegram voice OGGs, uploads to Gemini Files API for native transcription.
-Gemini 1.5 Flash handles audio natively — no Whisper or external STT needed.
+Gemini Flash handles audio natively — no Whisper or external STT needed.
+
+Uses the shared gateway so multi-key rotation applies to media requests too.
 """
-import asyncio
 import os
 import tempfile
 from typing import Optional
 
-import google.generativeai as genai
-
-from config import settings
 from ai.gateway import get_gateway
+
+TRANSCRIBE_PROMPT = (
+    "This is a voice message from a finance professional. "
+    "Transcribe exactly what was said, preserving all details about "
+    "companies, tickers, numbers, and financial terms mentioned. "
+    "Return ONLY the transcription, nothing else."
+)
 
 
 async def transcribe_and_respond(
     voice_file_path: str,
+    mime_type: str = "audio/ogg",
     user_context: str = ""
 ) -> str:
     """
     Transcribe a voice message and extract the user's intent.
 
     Args:
-        voice_file_path: Path to downloaded OGG/voice file
+        voice_file_path: Path to downloaded voice/audio file
+        mime_type: MIME type of the audio file (ogg for voice, mpeg for audio)
         user_context: Optional context about the user for personalization
 
     Returns:
         Transcribed text content ready to pass to the AI agent
     """
-    # Configure Gemini with first available key
-    api_key = settings.gemini_api_keys[0]
-    genai.configure(api_key=api_key)
+    gateway = get_gateway()
+    uploaded = None
 
     try:
-        # Upload file to Gemini Files API
-        uploaded = await asyncio.to_thread(
-            genai.upload_file,
-            path=voice_file_path,
-            mime_type="audio/ogg"
-        )
-
-        # Use Gemini Flash for fast audio transcription
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
-
-        prompt = (
-            "This is a voice message from a finance professional. "
-            "Transcribe exactly what was said, preserving all details about "
-            "companies, tickers, numbers, and financial terms mentioned. "
-            "Return ONLY the transcription, nothing else."
-        )
-
-        response = await asyncio.to_thread(
-            model.generate_content,
-            [uploaded, prompt]
-        )
-
-        # Clean up uploaded file
-        try:
-            await asyncio.to_thread(uploaded.delete)
-        except Exception:
-            pass
-
-        transcription = response.text.strip()
-        return transcription if transcription else "Could not transcribe voice message."
-
+        uploaded = await gateway.upload_file(voice_file_path, mime_type)
+        text = await gateway.generate_with_file(uploaded, TRANSCRIBE_PROMPT)
+        return text.strip() if text and text.strip() else "Could not transcribe voice message."
     except Exception as e:
         return f"[Voice transcription failed: {str(e)}]"
+    finally:
+        if uploaded:
+            await gateway.delete_file(uploaded)
 
 
 async def download_voice_file(file_obj, bot) -> Optional[str]:
