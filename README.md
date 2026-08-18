@@ -57,10 +57,15 @@ usage at https://ai.dev/rate-limit. Multi-key rotation multiplies your quota.
 hackathon/
 ├── main.py                   # FastAPI + Telegram bot entry point
 ├── config.py                 # Pydantic settings (loads from .env)
+├── Dockerfile                # Container image (Render deploy)
+├── render.yaml               # Render.com blueprint (auto-deploy)
 ├── docker-compose.yml        # Local MongoDB + Qdrant stack
 ├── requirements.txt          # Runtime deps (cloud deploy)
 ├── requirements-local.txt    # Runtime deps (local, free-tier pins)
 ├── requirements-dev.txt      # + test deps (pytest)
+│
+├── .github/workflows/
+│   └── ci.yml                # CI: compile check + offline pytest
 │
 ├── ai/
 │   ├── gateway.py            # Multi-key Gemini gateway: retries, rotation,
