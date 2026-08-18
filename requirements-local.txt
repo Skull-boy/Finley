@@ -1,3 +1,7 @@
+# ─── LOCAL TESTING requirements (no Qdrant/gRPC — memory feature disabled) ───
+# Use this for local testing: pip install -r requirements-local.txt
+# For production deployment (Render), use requirements.txt
+
 # ─── Web Framework ───────────────────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
@@ -8,12 +12,9 @@ python-telegram-bot==21.6
 # ─── Google Generative AI (Gemini) ───────────────────────────────────────────
 google-genai>=2.0.0
 
-# ─── Database ────────────────────────────────────────────────────────────────
-motor>=3.5.0               # Async MongoDB driver
-pymongo>=4.8.0             # Sync MongoDB (for APScheduler)
-
-# ─── Vector Database ─────────────────────────────────────────────────────────
-qdrant-client>=1.9.2
+# ─── Database (MongoDB) ──────────────────────────────────────────────────────
+motor>=3.5.0
+pymongo>=4.8.0
 
 # ─── Financial Data ──────────────────────────────────────────────────────────
 yfinance>=0.2.40
@@ -41,3 +42,8 @@ python-dotenv==1.0.1
 # ─── Utilities ───────────────────────────────────────────────────────────────
 python-multipart==0.0.9
 tenacity==8.3.0
+
+# NOTE: qdrant-client is intentionally omitted here.
+# It requires grpcio-tools which has no Python 3.14 binary wheel.
+# The bot runs fine without it — semantic memory search is just disabled.
+# On Render (Python 3.11), use the full requirements.txt

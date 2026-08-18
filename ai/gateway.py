@@ -1,17 +1,23 @@
+
 """Gemini AI — Multi-key API Gateway with automatic rotation and fallback.
 
 Creates multiple Gemini clients (one per API key from different GCP projects).
 When one key hits a rate limit (429), automatically rotates to the next.
 This gives us 3x the free quota: ~4,500 requests/day for a demo.
+
+Uses the new `google.genai` SDK (google-generativeai is deprecated).
 """
 import asyncio
+import logging
 import time
 from typing import Any, Dict, List, Optional
 
-import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
+from google import genai
+from google.genai import types
 
 from config import settings
+
+logger = logging.getLogger("finbot")
 
 
 class GeminiGateway:
@@ -20,41 +26,53 @@ class GeminiGateway:
 
     Usage:
         gateway = GeminiGateway()
-        response = await gateway.generate(prompt, system_prompt=..., history=...)
+        response = await gateway.generate(prompt, system_prompt=..., history=...)\
     """
 
-    FAST_MODEL = "gemini-1.5-flash-latest"   # High quota, fast — use for most requests
-    SMART_MODEL = "gemini-1.5-pro-latest"    # More capable — use for complex analysis
+    FAST_MODEL = "gemini-3.6-flash"      # High quota, fast — use for most requests
+    SMART_MODEL = "gemini-2.5-pro"       # More capable — use for complex analysis
+    EMBED_MODEL = "gemini-embedding-001"  # 768-dim embeddings (matches Qdrant collection)
+
+    MAX_ATTEMPTS = 6  # Retry cap across all keys — never recurse forever
 
     def __init__(self):
         self.api_keys = settings.gemini_api_keys
         if not self.api_keys:
             raise ValueError("At least one Gemini API key required (GEMINI_API_KEY_1)")
 
+        # Create one client per key
+        self.clients = [genai.Client(api_key=k) for k in self.api_keys]
         self.current_index = 0
         self.cooldowns: Dict[int, float] = {}  # key_index → cooldown_until timestamp
         self._lock = asyncio.Lock()
 
     # ─── Private helpers ──────────────────────────────────────────────────────
 
-    def _get_available_key(self) -> Optional[str]:
-        """Get next available API key, skipping those on cooldown."""
+    def _get_available_client(self):
+        """Get next available client, skipping those on cooldown."""
         now = time.time()
-        for i in range(len(self.api_keys)):
-            idx = (self.current_index + i) % len(self.api_keys)
+        for i in range(len(self.clients)):
+            idx = (self.current_index + i) % len(self.clients)
             if self.cooldowns.get(idx, 0) < now:
                 self.current_index = idx
-                return self.api_keys[idx]
-        return None  # All keys on cooldown
+                return self.clients[idx], idx
+        return None, -1
+
+    async def _pick_client(self):
+        """Get next available client under lock, skipping those on cooldown."""
+        async with self._lock:
+            return self._get_available_client()
 
     def _put_on_cooldown(self, key_index: int, seconds: int = 65):
         """Put a key on cooldown after hitting rate limit."""
         self.cooldowns[key_index] = time.time() + seconds
-        self.current_index = (key_index + 1) % len(self.api_keys)
+        self.current_index = (key_index + 1) % len(self.clients)
 
-    def _configure_client(self, api_key: str):
-        """Configure the Gemini client with the given API key."""
-        genai.configure(api_key=api_key)
+    @staticmethod
+    def _is_transient(e: Exception) -> bool:
+        """True for 429 (rate limit) or 5xx (transient server errors)."""
+        code = getattr(e, "code", None)
+        return code == 429 or (isinstance(code, int) and 500 <= code < 600)
 
     # ─── Core generation ──────────────────────────────────────────────────────
 
@@ -63,111 +81,133 @@ class GeminiGateway:
         prompt: str,
         system_prompt: str = "",
         history: Optional[List[Dict]] = None,
-        tools: Optional[Any] = None,   # single Tool or list of Tools
+        tools: Optional[Any] = None,
         model: str = FAST_MODEL,
         temperature: float = 0.7,
+        user_id: Optional[int] = None,
     ) -> str:
         """
         Generate a response from Gemini.
-        Automatically rotates keys on rate limit errors.
+        Automatically rotates keys on rate limit errors, with a bounded retry loop.
 
         Returns the text response string.
         """
-        async with self._lock:
-            api_key = self._get_available_key()
-            current_key_idx = self.current_index
-
-        if not api_key:
-            # All keys exhausted — wait and retry with exponential backoff
-            await asyncio.sleep(30)
-            return await self.generate(prompt, system_prompt, history, tools, model, temperature)
-
-        self._configure_client(api_key)
-
-        # Build the Gemini model
-        model_kwargs: Dict[str, Any] = {
-            "model_name": model,
-            "generation_config": genai.types.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=2048,
-            ),
-        }
-        if system_prompt:
-            model_kwargs["system_instruction"] = system_prompt
+        # Build config
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=2048,
+            system_instruction=system_prompt if system_prompt else None,
+        )
         if tools is not None:
-            # Accept either a single Tool or a list; always pass as list to SDK
-            model_kwargs["tools"] = tools if isinstance(tools, list) else [tools]
-
-        gemini_model = genai.GenerativeModel(**model_kwargs)
+            config.tools = tools if isinstance(tools, list) else [tools]
 
         # Convert history to Gemini format
         gemini_history = []
         if history:
             for msg in history:
                 role = "user" if msg["role"] == "user" else "model"
-                gemini_history.append({"role": role, "parts": [msg["content"]]})
+                gemini_history.append(
+                    types.Content(role=role, parts=[types.Part(text=msg["content"])])
+                )
 
-        try:
-            chat = gemini_model.start_chat(history=gemini_history)
+        for _ in range(self.MAX_ATTEMPTS):
+            client, current_key_idx = await self._pick_client()
 
-            if tools is not None:
-                # Agentic loop: handle tool calls
-                return await self._agentic_loop(chat, prompt)
-            else:
-                response = await chat.send_message_async(prompt)
-                return response.text
+            if client is None:
+                # All keys exhausted — wait for earliest cooldown to expire
+                now = time.time()
+                next_free = min(self.cooldowns.values(), default=now)
+                await asyncio.sleep(min(max(0.0, next_free - now) + 1, 30))
+                continue
 
-        except ResourceExhausted:
-            async with self._lock:
-                self._put_on_cooldown(current_key_idx)
-            # Retry with next key
-            return await self.generate(prompt, system_prompt, history, tools, model, temperature)
+            try:
+                if tools is not None:
+                    return await self._agentic_loop(
+                        client, model, config, gemini_history, prompt, user_id
+                    )
+                else:
+                    # Use chat for history support
+                    chat = client.aio.chats.create(
+                        model=model,
+                        history=gemini_history,
+                        config=config,
+                    )
+                    response = await chat.send_message(prompt)
+                    return response.text or "I couldn't generate a response."
 
-        except ServiceUnavailable:
-            await asyncio.sleep(5)
-            return await self.generate(prompt, system_prompt, history, tools, model, temperature)
+            except Exception as e:
+                if not self._is_transient(e):
+                    logger.error(f"❌ Gemini error (key idx {current_key_idx}): {type(e).__name__}: {e}")
+                    raise RuntimeError(f"Gemini generation failed: {e}") from e
+                if getattr(e, "code", None) == 429:
+                    async with self._lock:
+                        self._put_on_cooldown(current_key_idx)
+                    logger.warning(f"Gemini rate limited on key {current_key_idx} — rotating")
+                else:
+                    logger.warning(f"Gemini transient error (key idx {current_key_idx}): {type(e).__name__} {getattr(e, 'code', '?')} — retrying")
+                    await asyncio.sleep(10)
 
-        except Exception as e:
-            raise RuntimeError(f"Gemini generation failed: {e}") from e
+        raise RuntimeError("All Gemini API keys are exhausted. Please try again later.")
 
-    async def _agentic_loop(self, chat, initial_prompt: str) -> str:
+    async def _send_with_retry(self, chat: Any, content: Any, attempts: int = 3) -> Any:
+        """Send a chat message, retrying transient 429/5xx errors in place."""
+        for attempt in range(attempts):
+            try:
+                return await chat.send_message(content)
+            except Exception as e:
+                if not self._is_transient(e):
+                    raise
+                if attempt < attempts - 1:
+                    await asyncio.sleep(8 * (attempt + 1))
+        raise RuntimeError("Gemini transient error persisted after retries.")
+
+    async def _agentic_loop(
+        self,
+        client: genai.Client,
+        model: str,
+        config: types.GenerateContentConfig,
+        history: List,
+        initial_prompt: str,
+        user_id: Optional[int] = None,
+    ) -> str:
         """
         Run the Gemini agentic loop for tool-calling.
-        Sends the prompt, handles function calls, sends results back,
-        and repeats until Gemini gives a final text response.
         """
         from ai.tools import execute_tool
 
-        response = await chat.send_message_async(initial_prompt)
-        max_iterations = 5  # Prevent infinite loops
+        chat = client.aio.chats.create(
+            model=model,
+            history=history,
+            config=config,
+        )
+
+        response = await self._send_with_retry(chat, initial_prompt)
+        max_iterations = 5
 
         for _ in range(max_iterations):
-            # Check if there are function calls in the response
             function_calls = []
-            for candidate in response.candidates:
-                for part in candidate.content.parts:
-                    if hasattr(part, "function_call") and part.function_call.name:
-                        function_calls.append(part.function_call)
+            for part in (response.candidates[0].content.parts if response.candidates else []):
+                if hasattr(part, "function_call") and part.function_call and part.function_call.name:
+                    function_calls.append(part.function_call)
 
             if not function_calls:
-                # No more tool calls — extract and return text
+                # No more tool calls — return text
                 text = ""
-                for candidate in response.candidates:
-                    for part in candidate.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            text += part.text
+                for part in (response.candidates[0].content.parts if response.candidates else []):
+                    if hasattr(part, "text") and part.text:
+                        text += part.text
                 return text or "I couldn't generate a response."
 
-            # Execute all requested tool calls (potentially in parallel)
+            # Execute all tool calls
             tool_results = await asyncio.gather(*[
-                execute_tool(fc.name, dict(fc.args))
+                execute_tool(fc.name, dict(fc.args), user_id=user_id)
                 for fc in function_calls
             ])
 
             # Build function response parts
             function_response_parts = [
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
+                types.Part(
+                    function_response=types.FunctionResponse(
                         name=fc.name,
                         response={"result": result}
                     )
@@ -175,44 +215,117 @@ class GeminiGateway:
                 for fc, result in zip(function_calls, tool_results)
             ]
 
-            # Send tool results back to Gemini
-            response = await chat.send_message_async(function_response_parts)
+            response = await self._send_with_retry(chat, function_response_parts)
 
-        # After max iterations, try to extract any available text
+        # After max iterations, extract available text
         text = ""
-        for candidate in response.candidates:
-            for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
-                    text += part.text
+        for part in (response.candidates[0].content.parts if response.candidates else []):
+            if hasattr(part, "text") and part.text:
+                text += part.text
         return text or "I processed your request but couldn't generate a final response."
 
     # ─── Embedding generation ─────────────────────────────────────────────────
 
     async def embed(self, text: str) -> List[float]:
-        """Generate text embedding using Gemini's embedding model."""
-        async with self._lock:
-            api_key = self._get_available_key()
-            key_idx = self.current_index
+        """Generate a text embedding using Gemini's embedding model (768-dim)."""
+        for _ in range(self.MAX_ATTEMPTS):
+            client, key_idx = await self._pick_client()
 
-        if not api_key:
-            await asyncio.sleep(10)
-            return await self.embed(text)
+            if client is None:
+                await asyncio.sleep(10)
+                continue
 
-        self._configure_client(api_key)
+            try:
+                result = await asyncio.to_thread(
+                    client.models.embed_content,
+                    model=self.EMBED_MODEL,
+                    contents=text,
+                    config=types.EmbedContentConfig(output_dimensionality=768),
+                )
+                return result.embeddings[0].values if result.embeddings else []
+            except Exception as e:
+                if not self._is_transient(e):
+                    return []  # Non-transient: return empty rather than crash
+                if getattr(e, "code", None) == 429:
+                    async with self._lock:
+                        self._put_on_cooldown(key_idx)
+                else:
+                    await asyncio.sleep(5)
 
+        return []
+
+    # ─── File upload (voice, documents, images) ───────────────────────────────
+
+    async def upload_file(self, file_path: str, mime_type: str) -> Any:
+        """Upload a file to the Gemini Files API using an available key."""
+        for _ in range(self.MAX_ATTEMPTS):
+            client, key_idx = await self._pick_client()
+
+            if client is None:
+                await asyncio.sleep(30)
+                continue
+
+            try:
+                return await asyncio.to_thread(
+                    client.files.upload,
+                    file=file_path,
+                    config=types.UploadFileConfig(mime_type=mime_type),
+                )
+            except Exception as e:
+                if not self._is_transient(e):
+                    raise RuntimeError(f"File upload failed: {e}") from e
+                if getattr(e, "code", None) == 429:
+                    async with self._lock:
+                        self._put_on_cooldown(key_idx)
+                else:
+                    await asyncio.sleep(10)
+
+        raise RuntimeError("All Gemini API keys are exhausted for file upload.")
+
+    async def generate_with_file(
+        self,
+        uploaded_file: Any,
+        prompt: str,
+        model: str = FAST_MODEL,
+        temperature: float = 0.4,
+    ) -> str:
+        """Generate content from an uploaded file (audio/image/document)."""
+        for _ in range(self.MAX_ATTEMPTS):
+            client, key_idx = await self._pick_client()
+
+            if client is None:
+                await asyncio.sleep(30)
+                continue
+
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=[uploaded_file, prompt],
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        max_output_tokens=2048,
+                    ),
+                )
+                return response.text or ""
+            except Exception as e:
+                if not self._is_transient(e):
+                    raise RuntimeError(f"Gemini generation failed for uploaded file: {e}") from e
+                if getattr(e, "code", None) == 429:
+                    async with self._lock:
+                        self._put_on_cooldown(key_idx)
+                else:
+                    await asyncio.sleep(10)
+
+        raise RuntimeError("All Gemini API keys are exhausted.")
+
+    async def delete_file(self, uploaded_file: Any) -> None:
+        """Best-effort cleanup of an uploaded file."""
         try:
-            result = await asyncio.to_thread(
-                genai.embed_content,
-                model="models/text-embedding-004",
-                content=text
-            )
-            return result["embedding"]
-        except ResourceExhausted:
-            async with self._lock:
-                self._put_on_cooldown(key_idx)
-            return await self.embed(text)
+            client, _ = await self._pick_client()
+            if client:
+                await asyncio.to_thread(client.files.delete, name=uploaded_file.name)
         except Exception:
-            return []  # Return empty embedding rather than crashing
+            pass
 
 
 # ─── Singleton instance ───────────────────────────────────────────────────────
