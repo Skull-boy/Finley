@@ -1,8 +1,10 @@
-# Finley — AI Financial Assistant
+# Finley — Your AI Financial Co-Pilot in Telegram
 
-> An AI-powered financial co-pilot that lives inside Telegram.
+> Talk to Finley like an analyst. It answers with live market data — no commands, no dashboards, no jargon.
 
-Built with Google Gemini (free tier), multi-key API rotation, semantic memory, and real-time financial data.
+Finley is a Telegram-native AI assistant that pairs Gemini's reasoning with real-time financial data from Finnhub, yfinance, and SEC EDGAR — backed by persistent semantic memory. Ask about any stock, send a voice note, drop in a PDF or an earnings chart, and Finley researches it, remembers your preferences, and proactively keeps an eye on your portfolio with price alerts and personalized morning briefings.
+
+Built entirely on free tiers: Google Gemini with automatic multi-key rotation, MongoDB + Qdrant (local Docker or cloud), and zero paid APIs.
 
 ---
 
