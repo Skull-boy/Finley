@@ -117,6 +117,7 @@ class GeminiGateway:
                     types.Content(role=role, parts=[types.Part(text=msg["content"])])
                 )
 
+        last_finish = None
         for _ in range(self.MAX_ATTEMPTS):
             client, current_key_idx = await self._pick_client()
 
@@ -140,7 +141,13 @@ class GeminiGateway:
                         config=config,
                     )
                     response = await chat.send_message(prompt)
-                    return response.text or "I couldn't generate a response."
+                    if response.text:
+                        return response.text
+                    last_finish = getattr(response, "finish_reason", None)
+                    logger.warning(
+                        f"Empty Gemini response (finish_reason={last_finish}) — retrying"
+                    )
+                    await asyncio.sleep(3)
 
             except Exception as e:
                 if not self._is_transient(e):
@@ -154,6 +161,10 @@ class GeminiGateway:
                     logger.warning(f"Gemini transient error (key idx {current_key_idx}): {type(e).__name__} {getattr(e, 'code', '?')} — retrying")
                     await asyncio.sleep(10)
 
+        if last_finish is not None:
+            raise RuntimeError(
+                f"Gemini returned an empty response (finish_reason={last_finish})."
+            )
         raise RuntimeError("All Gemini API keys are exhausted. Please try again later.")
 
     async def _send_with_retry(self, chat: Any, content: Any, attempts: int = 3) -> Any:
@@ -203,7 +214,15 @@ class GeminiGateway:
                 for part in (response.candidates[0].content.parts if response.candidates else []):
                     if hasattr(part, "text") and part.text:
                         text += part.text
-                return text or "I couldn't generate a response."
+                if text:
+                    return text
+                finish_reason = (
+                    response.candidates[0].finish_reason if response.candidates else None
+                )
+                logger.warning(
+                    f"Agentic loop: no tool calls and no text (finish_reason={finish_reason})"
+                )
+                return "I couldn't generate a response."
 
             # Execute all tool calls
             tool_results = await asyncio.gather(*[
@@ -226,9 +245,14 @@ class GeminiGateway:
 
         # After max iterations, extract available text
         text = ""
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
         for part in (response.candidates[0].content.parts if response.candidates else []):
             if hasattr(part, "text") and part.text:
                 text += part.text
+        if not text:
+            logger.warning(
+                f"Agentic loop hit iteration cap without text (finish_reason={finish_reason})"
+            )
         return text or "I processed your request but couldn't generate a final response."
 
     # ─── Embedding generation ─────────────────────────────────────────────────
