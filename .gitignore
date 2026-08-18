@@ -20,6 +20,11 @@ venv/
 .venv/
 env/
 ENV/
+finley/
+graphify-env/
+
+# graphify output
+graphify-out/
 
 # IDE
 .vscode/

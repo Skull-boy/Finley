@@ -13,7 +13,7 @@ services:
       MONGO_INITDB_DATABASE: finbot
 
   qdrant:
-    image: qdrant/qdrant:v1.9.2
+    image: qdrant/qdrant:v1.12.6
     container_name: finbot_qdrant
     restart: unless-stopped
     ports:
