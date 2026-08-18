@@ -209,7 +209,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         # Transcribe
-        transcription = await transcribe_and_respond(tmp_path)
+        mime_type = "audio/ogg" if update.message.voice else "audio/mpeg"
+        transcription = await transcribe_and_respond(tmp_path, mime_type=mime_type)
 
         if not transcription or transcription.startswith("[Voice transcription failed"):
             await update.message.reply_text(
@@ -227,8 +228,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Process the transcribed text
         if not user.get("onboarding_complete"):
-            # For onboarding voice, create a mock-friendly approach
-            response = await get_agent().process(user_id, transcription, "voice")
+            response = await handle_onboarding_message(update, context, user, text_override=transcription)
         else:
             response = await get_agent().process(user_id, transcription, "voice")
 

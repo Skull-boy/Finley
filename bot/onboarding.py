@@ -16,23 +16,30 @@ from telegram.ext import ContextTypes
 
 from ai.gateway import get_gateway
 from ai.prompts import build_onboarding_prompt
-from db.crud import update_user, update_user_profile, add_to_watchlist, save_message, get_user
+from db.crud import update_user, update_user_profile, add_to_watchlist, save_message
 
 
 async def handle_onboarding_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    user: Dict[str, Any]
+    user: Dict[str, Any],
+    text_override: str = ""
 ) -> str:
     """
     Handle a message from a user in onboarding mode.
+
+    Args:
+        text_override: For voice messages — the transcription to use as the message text
 
     Returns:
         The AI response to send to the user.
         If onboarding is complete, also updates the database.
     """
     user_id = update.effective_user.id
-    user_message = update.message.text or ""
+    user_message = (text_override or update.message.text or "").strip()
+
+    if not user_message:
+        return "I heard your message but couldn't read it. Could you type it instead?"
 
     # Get what we've collected so far from user profile
     profile = user.get("profile", {})
