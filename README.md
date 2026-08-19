@@ -8,6 +8,9 @@ Built entirely on free tiers: Google Gemini with automatic multi-key rotation, M
 
 [![Finley: Your AI Financial Co-Pilot for Telegram](https://repoclip.io/api/badge/7e3f4714-2259-4daa-a32e-f7aff6dfa4ee)](https://repoclip.io/v/7e3f4714-2259-4daa-a32e-f7aff6dfa4ee)
 
+[![GitHub Stars](https://img.shields.io/github/stars/Skull-boy/Finley?style=for-the-badge&logo=github&color=gold)](https://github.com/Skull-boy/Finley)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
 ---
 
 ## 🚀 Quick Setup (Local)
@@ -203,3 +206,9 @@ curl http://localhost:8000/health
 
 ## 📝 License
 MIT
+
+Released under the [MIT License](LICENSE) — you are free to use, modify, and
+distribute this project for personal or commercial purposes, provided you
+include the original copyright notice and permission notice in any copy or
+substantial portion of the software. The software is provided "as is", without
+warranty of any kind.

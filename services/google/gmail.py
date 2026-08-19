@@ -4,6 +4,7 @@ OAuth2 flow + email search and summarization for finance professionals.
 """
 import asyncio
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +14,8 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 from config import settings
+
+logger = logging.getLogger("finbot")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -44,12 +47,11 @@ def create_oauth_flow() -> Flow:
 def get_authorization_url(state: str) -> str:
     """
     Generate the Google OAuth authorization URL.
-    State is the user's Telegram ID so we know who to update after callback.
+    State must be a signed, expiring token (security/state.py) — never a raw ID.
     """
     flow = create_oauth_flow()
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         state=state
     )
     return auth_url
@@ -71,7 +73,15 @@ async def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
 
 
 def _build_credentials(token_data: Dict) -> Credentials:
-    """Build Google Credentials object from stored token dict."""
+    """Build Google Credentials object from stored token data.
+
+    Stored blobs are Fernet-encrypted at rest (security/token_crypto.py);
+    legacy plaintext dicts are still accepted so existing users keep working.
+    """
+    if isinstance(token_data, str):
+        from security.token_crypto import decrypt_token_blob
+        token_data = decrypt_token_blob(token_data)
+
     creds = Credentials(
         token=token_data.get("token"),
         refresh_token=token_data.get("refresh_token"),
@@ -81,7 +91,7 @@ def _build_credentials(token_data: Dict) -> Credentials:
         scopes=token_data.get("scopes", SCOPES),
     )
 
-    # Refresh if expired
+    # Refresh if expired (google.auth transport defaults to a 120s timeout)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
@@ -98,12 +108,15 @@ async def search_emails(token_data: Dict, query: str, max_results: int = 10) -> 
         service = await asyncio.to_thread(build, "gmail", "v1", credentials=creds)
 
         # Search messages
-        results = await asyncio.to_thread(
-            lambda: service.users().messages().list(
-                userId="me",
-                q=query,
-                maxResults=max_results
-            ).execute()
+        results = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: service.users().messages().list(
+                    userId="me",
+                    q=query,
+                    maxResults=max_results
+                ).execute()
+            ),
+            timeout=20,
         )
 
         messages = results.get("messages", [])
@@ -113,13 +126,16 @@ async def search_emails(token_data: Dict, query: str, max_results: int = 10) -> 
         # Get snippet for each message
         email_summaries = []
         for msg in messages[:5]:
-            msg_data = await asyncio.to_thread(
-                lambda m=msg: service.users().messages().get(
-                    userId="me",
-                    id=m["id"],
-                    format="metadata",
-                    metadataHeaders=["Subject", "From", "Date"]
-                ).execute()
+            msg_data = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda m=msg: service.users().messages().get(
+                        userId="me",
+                        id=m["id"],
+                        format="metadata",
+                        metadataHeaders=["Subject", "From", "Date"]
+                    ).execute()
+                ),
+                timeout=20,
             )
 
             headers = {h["name"]: h["value"] for h in msg_data.get("payload", {}).get("headers", [])}
@@ -144,11 +160,15 @@ async def get_email_count(token_data: Dict, query: str) -> int:
     try:
         creds = await asyncio.to_thread(_build_credentials, token_data)
         service = await asyncio.to_thread(build, "gmail", "v1", credentials=creds)
-        results = await asyncio.to_thread(
-            lambda: service.users().messages().list(
-                userId="me", q=query, maxResults=1
-            ).execute()
+        results = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: service.users().messages().list(
+                    userId="me", q=query, maxResults=1
+                ).execute()
+            ),
+            timeout=20,
         )
         return results.get("resultSizeEstimate", 0)
-    except Exception:
+    except Exception as e:
+        logger.warning("Gmail count lookup failed: %s", e)
         return 0

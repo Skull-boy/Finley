@@ -3,12 +3,15 @@ Google Calendar integration service.
 Lists upcoming meetings and helps prepare for them with financial context.
 """
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from googleapiclient.discovery import build
 
 from services.google.gmail import _build_credentials, SCOPES
+
+logger = logging.getLogger("finbot")
 
 
 async def get_upcoming_events(token_data: Dict, days: int = 7) -> str:
@@ -23,15 +26,18 @@ async def get_upcoming_events(token_data: Dict, days: int = 7) -> str:
         now = datetime.now(timezone.utc).isoformat()
         end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
-        events_result = await asyncio.to_thread(
-            lambda: service.events().list(
-                calendarId="primary",
-                timeMin=now,
-                timeMax=end,
-                maxResults=10,
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute()
+        events_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: service.events().list(
+                    calendarId="primary",
+                    timeMin=now,
+                    timeMax=end,
+                    maxResults=10,
+                    singleEvents=True,
+                    orderBy="startTime"
+                ).execute()
+            ),
+            timeout=20,
         )
 
         events = events_result.get("items", [])
@@ -84,18 +90,22 @@ async def get_todays_meetings(token_data: Dict) -> List[Dict]:
         start_of_day = now.replace(hour=0, minute=0, second=0).isoformat()
         end_of_day = now.replace(hour=23, minute=59, second=59).isoformat()
 
-        events_result = await asyncio.to_thread(
-            lambda: service.events().list(
-                calendarId="primary",
-                timeMin=start_of_day,
-                timeMax=end_of_day,
-                maxResults=10,
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute()
+        events_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: service.events().list(
+                    calendarId="primary",
+                    timeMin=start_of_day,
+                    timeMax=end_of_day,
+                    maxResults=10,
+                    singleEvents=True,
+                    orderBy="startTime"
+                ).execute()
+            ),
+            timeout=20,
         )
 
         return events_result.get("items", [])
 
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not fetch today's meetings: %s", e)
         return []

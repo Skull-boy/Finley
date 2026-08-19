@@ -27,7 +27,11 @@ async def get_company_financials(ticker: str) -> str:
     ticker = ticker.upper().strip()
 
     try:
-        info = await asyncio.to_thread(_fetch_yf_info, ticker)
+        # yfinance has no timeout of its own — bound it so a slow Yahoo
+        # response can't hang the shared thread pool.
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_fetch_yf_info, ticker), timeout=15
+        )
 
         if not info or not info.get("regularMarketPrice") and not info.get("currentPrice"):
             return f"Could not retrieve fundamentals for <code>{ticker}</code>. Ticker may be invalid."
@@ -100,7 +104,9 @@ async def compare_companies(tickers: List[str]) -> str:
     async def _get_metrics(ticker: str) -> Optional[Dict]:
         try:
             # Use named function — NOT lambda — to avoid closure capture issues in asyncio.to_thread
-            info = await asyncio.to_thread(_fetch_yf_info, ticker)
+            info = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_yf_info, ticker), timeout=15
+            )
             if not info:
                 return None
             return {

@@ -25,6 +25,15 @@ class AlertType(str, Enum):
     DAILY_MOVE = "daily_move"
 
 
+def is_google_connected(user: Optional[Dict[str, Any]]) -> bool:
+    """True if the user has a linked (connected) Google integration."""
+    return bool(
+        (user or {}).get("integrations", {})
+        .get("gmail", {})
+        .get("connected")
+    )
+
+
 def new_user(telegram_id: int, username: str = "", first_name: str = "") -> Dict[str, Any]:
     """Create a new user document."""
     return {

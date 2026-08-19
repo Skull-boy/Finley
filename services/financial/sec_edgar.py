@@ -28,6 +28,10 @@ async def get_company_cik(ticker: str) -> Optional[str]:
     if ticker in _cik_cache:
         return _cik_cache[ticker]
 
+    # Bounded cache — a flood of distinct tickers must not grow memory forever
+    if len(_cik_cache) > 2000:
+        _cik_cache.clear()
+
     try:
         async with httpx.AsyncClient(timeout=10, headers=HEADERS) as client:
             r = await client.get("https://www.sec.gov/files/company_tickers.json")

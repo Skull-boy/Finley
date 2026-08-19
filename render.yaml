@@ -31,5 +31,11 @@ services:
         sync: false
       - key: GOOGLE_REDIRECT_URI
         sync: false
+      - key: SEC_CONTACT_EMAIL
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
       - key: APP_ENV
         value: production

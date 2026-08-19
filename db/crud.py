@@ -20,7 +20,12 @@ _db: Optional[AsyncIOMotorDatabase] = None
 async def connect_db() -> AsyncIOMotorDatabase:
     """Initialize MongoDB connection. Call once at startup."""
     global _client, _db
-    _client = AsyncIOMotorClient(settings.mongodb_uri)
+    # Short server-selection timeout so startup failures surface quickly
+    # instead of hanging for the 30s default (retry handled by the caller).
+    _client = AsyncIOMotorClient(
+        settings.mongodb_uri,
+        serverSelectionTimeoutMS=5000,
+    )
     _db = _client[settings.mongodb_db_name]
     # Create indexes
     await _db.users.create_index("telegram_id", unique=True)
@@ -77,13 +82,33 @@ async def update_user_profile(telegram_id: int, profile_updates: Dict[str, Any])
     await get_db().users.update_one({"telegram_id": telegram_id}, {"$set": set_ops})
 
 
-async def add_to_watchlist(telegram_id: int, tickers: List[str]) -> None:
-    """Add tickers to user watchlist (deduplicates automatically)."""
-    tickers_upper = [t.upper() for t in tickers]
-    await get_db().users.update_one(
-        {"telegram_id": telegram_id},
-        {"$addToSet": {"profile.watchlist": {"$each": tickers_upper}}}
+async def add_to_watchlist(telegram_id: int, tickers: List[str]) -> int:
+    """
+    Add tickers to user watchlist (validated, deduplicated, size-capped).
+    Returns the number of tickers actually added.
+    """
+    from security.validation import MAX_WATCHLIST_SIZE, clean_ticker
+
+    valid = [t for t in (clean_ticker(t) for t in tickers) if t]
+    if not valid:
+        return 0
+
+    user = await get_db().users.find_one(
+        {"telegram_id": telegram_id}, {"profile.watchlist": 1}
     )
+    existing = set((user or {}).get("profile", {}).get("watchlist", []) or [])
+    room = MAX_WATCHLIST_SIZE - len(existing)
+    if room <= 0:
+        return 0
+
+    # Dedupe against existing entries and within the batch, keep order
+    to_add = list(dict.fromkeys(t for t in valid if t not in existing))[:room]
+    if to_add:
+        await get_db().users.update_one(
+            {"telegram_id": telegram_id},
+            {"$addToSet": {"profile.watchlist": {"$each": to_add}}}
+        )
+    return len(to_add)
 
 
 async def get_all_users_with_briefing() -> List[Dict[str, Any]]:
@@ -92,12 +117,6 @@ async def get_all_users_with_briefing() -> List[Dict[str, Any]]:
         "onboarding_complete": True,
         "profile.briefing_time": {"$ne": None}
     })
-    return await cursor.to_list(length=None)
-
-
-async def get_all_users_with_alerts() -> List[Dict[str, Any]]:
-    """Get all users with active alerts."""
-    cursor = get_db().users.find({"onboarding_complete": True})
     return await cursor.to_list(length=None)
 
 

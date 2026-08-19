@@ -11,6 +11,7 @@ and "you mentioned you prefer concise responses."
 """
 import asyncio
 import json
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
@@ -19,6 +20,8 @@ from ai.gateway import get_gateway
 from db.crud import (
     get_memories, save_memory, update_memory_summary, get_user
 )
+
+logger = logging.getLogger("finbot")
 
 
 class MemoryManager:
@@ -138,8 +141,9 @@ Return ONLY the updated summary text."""
             if not isinstance(facts, list) or not facts:
                 return
 
-        except (json.JSONDecodeError, Exception):
-            return  # Silently skip if extraction fails
+        except Exception as e:
+            logger.warning("Memory extraction failed for user %d: %s", user_id, e)
+            return  # Skip extraction silently-ish — memory is best-effort, but visible
 
         # Store each fact with its embedding
         for fact in facts:

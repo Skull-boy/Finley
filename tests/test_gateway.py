@@ -97,6 +97,49 @@ async def test_agentic_loop_with_tools(gateway):
 
 
 @pytest.mark.asyncio
+async def test_agentic_loop_respects_iteration_cap(gateway, monkeypatch):
+    """A model that keeps requesting tool calls must be cut off after
+    settings.max_agentic_iterations rounds — bounds per-message quota burn."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "max_agentic_iterations", 2)
+
+    class ToolChat:
+        def __init__(self):
+            self.rounds = 0
+
+        async def send_message(self, content):
+            self.rounds += 1
+            fc = NS(name="get_stock_quote", args={"symbol": "AAPL"})
+            part = NS(function_call=fc, text=None)
+            return NS(
+                candidates=[NS(content=NS(parts=[part]), finish_reason=None)]
+            )
+
+    class ToolClient:
+        def __init__(self):
+            self.chat = ToolChat()
+            self.aio = NS(chats=NS(create=lambda **kw: self.chat))
+
+    tc = ToolClient()
+
+    async def pick():
+        return (tc, 0)
+
+    async def fake_execute_tool(name, args, user_id=None):
+        return {"price": 100.0}
+
+    with patch.object(gateway, "_pick_client", new=pick), \
+         patch("ai.tools.execute_tool", new=fake_execute_tool):
+        out = await gateway.generate("analyze this", tools="T")
+
+    assert "couldn't generate" in out.lower() or "processed your request" in out.lower()
+    # 1 initial prompt + exactly `cap` tool rounds — never one more
+    assert tc.chat.rounds == 1 + settings.max_agentic_iterations
+    assert tc.chat.rounds == 3  # cap=2 → 3 sends total
+
+
+@pytest.mark.asyncio
 async def test_non_transient_error_raises(gateway):
     fc = FakeClient(fails=1, error_cls=lambda: FakeClientError(400))
 

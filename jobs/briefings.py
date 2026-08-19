@@ -6,6 +6,7 @@ The briefing feels like getting a WhatsApp from an analyst friend —
 not a newsletter, not a report. Concise and immediately useful.
 """
 import asyncio
+import logging
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -21,6 +22,8 @@ from services.financial.earnings import get_earnings_calendar
 from services.financial.news import get_market_news
 from config import settings
 
+logger = logging.getLogger("finbot")
+
 
 async def send_morning_briefings(bot: Bot) -> None:
     """
@@ -29,7 +32,8 @@ async def send_morning_briefings(bot: Bot) -> None:
     """
     try:
         users = await get_all_users_with_briefing()
-    except Exception:
+    except Exception as e:
+        logger.warning("Briefing job could not load users: %s", e)
         return  # DB not ready yet
 
     now_utc = datetime.utcnow()
@@ -89,8 +93,11 @@ async def send_morning_briefings(bot: Bot) -> None:
                     "last_briefing_sent": datetime.utcnow().isoformat()
                 })
 
-        except Exception:
-            continue  # Never crash the whole job for one user
+        except Exception as e:
+            logger.warning(
+                "Briefing skipped for user %s (ticker/state error): %s",
+                user.get("telegram_id"), e,
+            )
 
 
 async def _generate_briefing(user: Dict[str, Any]) -> str:
@@ -151,5 +158,6 @@ async def _generate_briefing(user: Dict[str, Any]) -> str:
             temperature=0.6,
         )
         return response or ""
-    except Exception:
+    except Exception as e:
+        logger.warning("Briefing generation failed for user %s: %s", user.get("telegram_id"), e)
         return ""

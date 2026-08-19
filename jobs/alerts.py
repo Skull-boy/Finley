@@ -4,6 +4,7 @@ Runs every 5 minutes during market hours.
 Checks all active user alerts against live prices.
 """
 import asyncio
+import logging
 from datetime import datetime, time
 from typing import Any, Dict, List
 
@@ -14,6 +15,8 @@ from db.crud import get_all_active_alerts, mark_alert_triggered, deactivate_aler
 from services.financial.market import get_stock_quote
 import httpx
 from config import settings
+
+logger = logging.getLogger("finbot")
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -70,8 +73,13 @@ async def check_price_alerts(bot: Bot) -> None:
         for alert in ticker_alerts:
             try:
                 await _evaluate_alert(bot, alert, current_price)
-            except Exception:
-                continue
+            except Exception as e:
+                # A failing alert must never vanish silently — the user is
+                # waiting on a financial notification.
+                logger.error(
+                    "Alert evaluation failed (alert_id=%s, ticker=%s, user=%s): %s",
+                    alert.get("_id"), ticker, alert.get("user_id"), e,
+                )
 
 
 async def _evaluate_alert(bot: Bot, alert: Dict, current_price: float) -> None:
@@ -118,20 +126,33 @@ async def _evaluate_alert(bot: Bot, alert: Dict, current_price: float) -> None:
             )
 
     if triggered and user_id and message:
+        # Send first, then record state — each step logged separately so a
+        # partial failure (duplicate alert / lost alert) stays visible.
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=message,
                 parse_mode=ParseMode.HTML
             )
+        except Exception as e:
+            logger.error(
+                "Alert notification send FAILED (alert_id=%s, ticker=%s, user=%s): %s",
+                alert.get("_id"), ticker, user_id, e,
+            )
+            return  # Leave the alert active so it retries next cycle
+
+        try:
             await mark_alert_triggered(str(alert["_id"]))
 
             # Deactivate one-time alerts after triggering
             if alert_type in ["price_above", "price_below"]:
                 await deactivate_alert(str(alert["_id"]))
-
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(
+                "Alert state update FAILED after send (alert_id=%s, ticker=%s, user=%s) — "
+                "may re-trigger next cycle: %s",
+                alert.get("_id"), ticker, user_id, e,
+            )
 
 
 async def _get_batch_prices(tickers: List[str]) -> Dict[str, float]:

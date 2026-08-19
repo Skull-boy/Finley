@@ -4,6 +4,7 @@ Routes all incoming messages (text, voice, document, image) to the AI agent.
 Manages typing indicators, error handling, and response formatting.
 """
 import asyncio
+import logging
 import os
 import re
 import tempfile
@@ -22,9 +23,54 @@ from telegram.constants import ChatAction, ParseMode
 from ai.agent import get_agent, _format_for_telegram
 from bot.onboarding import handle_onboarding_message
 from db.crud import get_or_create_user, update_user, get_active_alerts
+from security.access import is_user_allowed
+from security.rate_limit import get_rate_limiter
+from security.state import create_state
 from services.media.voice import transcribe_and_respond, download_voice_file, cleanup_temp_file
 from services.media.documents import analyze_document, analyze_image, download_document, cleanup_temp_file as cleanup_doc
 from services.google.gmail import get_authorization_url
+
+logger = logging.getLogger("finbot")
+
+
+# ─── Access control ───────────────────────────────────────────────────────────
+
+async def _check_allowed(update: Update) -> bool:
+    """Deny users outside the optional allowlist. Returns True to proceed."""
+    if is_user_allowed(update.effective_user.id):
+        return True
+    logger.warning(
+        "Blocked message from unauthorized user %d (username=%r)",
+        update.effective_user.id, update.effective_user.username,
+    )
+    await update.message.reply_text(
+        "You're not authorized to use this bot.", parse_mode=ParseMode.HTML
+    )
+    return False
+
+
+async def _check_rate_limit(update: Update) -> bool:
+    """Per-user throttling to protect shared API quota. Returns True to proceed."""
+    limiter = get_rate_limiter()
+    if await limiter.allow(str(update.effective_user.id)):
+        return True
+    logger.warning(
+        "Rate limit hit for user %d — message dropped", update.effective_user.id
+    )
+    await update.message.reply_text(
+        "⏳ You're sending messages too quickly — take a breath and try again in a few seconds.",
+        parse_mode=ParseMode.HTML
+    )
+    return False
+
+
+async def _gate(update: Update, rate_limited: bool = True) -> bool:
+    """Allowlist + optional per-user rate limit. Returns True to proceed."""
+    if not await _check_allowed(update):
+        return False
+    if rate_limited and not await _check_rate_limit(update):
+        return False
+    return True
 
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
@@ -48,12 +94,15 @@ def setup_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("watchlist", handle_watchlist))
     app.add_handler(CommandHandler("alerts", handle_alerts))
+    app.add_handler(CommandHandler("disconnect", handle_disconnect))
 
 
 # ─── Command Handlers ─────────────────────────────────────────────────────────
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start — creates user and begins onboarding if needed."""
+    if not await _gate(update, rate_limited=False):
+        return
     user_tg = update.effective_user
     user = await get_or_create_user(
         telegram_id=user_tg.id,
@@ -72,7 +121,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             response = await handle_onboarding_message(update, context, user)
             await _send_response(update, response)
-        except Exception:
+        except Exception as e:
+            logger.error("Onboarding failed for user %d: %s", user_tg.id, e)
             await update.message.reply_text(
                 "Hi! I'm Finley, your AI financial assistant. Tell me a bit about yourself — "
                 "what kind of work do you do in finance?",
@@ -82,6 +132,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Brief help message — minimal, conversational."""
+    if not await _gate(update, rate_limited=False):
+        return
     await update.message.reply_text(
         "<b>I'm Finley — your AI financial assistant.</b>\n\n"
         "Just talk to me naturally. You can:\n"
@@ -97,6 +149,8 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def handle_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the user's current watchlist with live prices."""
+    if not await _gate(update):
+        return
     user_id = update.effective_user.id
     await _send_typing(update)
 
@@ -121,6 +175,8 @@ async def handle_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def handle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show active alerts for the user."""
+    if not await _gate(update):
+        return
     user_id = update.effective_user.id
     alerts = await get_active_alerts(user_id)
 
@@ -141,15 +197,50 @@ async def handle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def handle_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Revoke the Google integration — required before a user can re-auth."""
+    if not await _gate(update, rate_limited=False):
+        return
+    user_id = update.effective_user.id
+    try:
+        await update_user(user_id, {
+            "integrations.gmail": {"connected": False, "token": None, "email": None},
+            "integrations.google_calendar": {"connected": False, "token": None},
+        })
+        await update.message.reply_text(
+            "🔌 Disconnected your Google account. You can re-link it anytime "
+            "by saying <i>\"connect gmail\"</i>.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error("Disconnect failed for user %d: %s", user_id, e)
+        await update.message.reply_text(
+            "Couldn't disconnect right now — please try again later.",
+            parse_mode=ParseMode.HTML
+        )
+
+
 # ─── Main Message Handlers ────────────────────────────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all text messages — the main interaction flow."""
+    if not await _gate(update):
+        return
     user_id = update.effective_user.id
     user_tg = update.effective_user
     user_message = update.message.text or ""
 
     if not user_message.strip():
+        return
+
+    # Telegram hard-caps at 4096 chars; reject beyond 4000 to bound
+    # per-message prompt size and quota burn.
+    if len(user_message) > 4000:
+        await update.message.reply_text(
+            "That message was too long to process (max 4000 characters). "
+            "Could you split it up?",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     # Get or create user
@@ -178,6 +269,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send_response(update, response)
 
     except Exception as e:
+        logger.error("handle_text failed for user %d: %s", user_id, e)
         await update.message.reply_text(
             "I ran into an issue processing that. Could you try rephrasing?",
             parse_mode=ParseMode.HTML
@@ -186,6 +278,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle voice messages — transcribe via Gemini then process as text."""
+    if not await _gate(update):
+        return
     user_id = update.effective_user.id
     user_tg = update.effective_user
 
@@ -199,6 +293,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     voice = update.message.voice or update.message.audio
     if not voice:
+        return
+
+    # Cap audio size (platform-bounded, but a flood of large files still
+    # costs upload + Gemini Files storage per message).
+    if voice.file_size and voice.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text(
+            "That audio file is too large for me to process (max 20MB)."
+        )
         return
 
     # Download voice file
@@ -234,7 +336,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await _send_response(update, response)
 
-    except Exception:
+    except Exception as e:
+        logger.error("handle_voice failed for user %d: %s", user_id, e)
         await update.message.reply_text(
             "Sorry, I couldn't process that voice message. Please try again.",
             parse_mode=ParseMode.HTML
@@ -245,6 +348,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle document uploads — analyze with Gemini's document understanding."""
+    if not await _gate(update):
+        return
     user_id = update.effective_user.id
     user = await get_or_create_user(
         telegram_id=user_id,
@@ -290,7 +395,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         formatted = _format_for_telegram(analysis)
         await _send_response(update, formatted)
 
-    except Exception:
+    except Exception as e:
+        logger.error("handle_document failed for user %d (file=%r): %s", user_id, original_name, e)
         await update.message.reply_text(
             "Sorry, I couldn't analyze that document. Please try again.",
             parse_mode=ParseMode.HTML
@@ -301,6 +407,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle image uploads — analyze charts and financial screenshots."""
+    if not await _gate(update):
+        return
     user_id = update.effective_user.id
     user = await get_or_create_user(
         telegram_id=user_id,
@@ -315,6 +423,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     caption = update.message.caption or ""
     photo = update.message.photo[-1]  # Highest resolution
 
+    # Cap image size before downloading (protects upload + storage costs).
+    if photo.file_size and photo.file_size > 10 * 1024 * 1024:
+        await update.message.reply_text(
+            "That image is too large for me to analyze (max 10MB)."
+        )
+        return
+
     await _send_typing(update)
 
     # Download photo
@@ -327,7 +442,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await telegram_file.download_to_drive(tmp_path)
         analysis = await analyze_image(tmp_path, user_question=caption)
         await _send_response(update, _format_for_telegram(analysis))
-    except Exception:
+    except Exception as e:
+        logger.error("handle_photo failed for user %d: %s", user_id, e)
         await update.message.reply_text(
             "Sorry, I couldn't process that image. Please try again.",
             parse_mode=ParseMode.HTML
@@ -365,7 +481,7 @@ async def _start_gmail_oauth(user_id: int) -> str:
         )
 
     try:
-        auth_url = get_authorization_url(state=str(user_id))
+        auth_url = get_authorization_url(state=create_state(user_id))
         return (
             "🔗 <b>Connect your Google Account</b>\n\n"
             f"Click this link to authorize access to Gmail and Calendar:\n"
@@ -373,7 +489,8 @@ async def _start_gmail_oauth(user_id: int) -> str:
             "<i>This allows me to search your emails and check your calendar for meeting prep. "
             "You can revoke access anytime.</i>"
         )
-    except Exception:
+    except Exception as e:
+        logger.error("Could not generate Google auth link for user %d: %s", user_id, e)
         return "Could not generate authorization link. Please try again later."
 
 

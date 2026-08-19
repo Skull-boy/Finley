@@ -57,7 +57,11 @@ async def get_stock_quote(ticker: str) -> str:
 async def _yfinance_quote_fallback(ticker: str) -> str:
     """Fallback to yfinance if Finnhub fails."""
     try:
-        info = await asyncio.to_thread(_get_yf_info, ticker)
+        # yfinance has no timeout of its own — bound it so a slow Yahoo
+        # response can't hang the shared thread pool.
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_get_yf_info, ticker), timeout=15
+        )
         price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
         prev = info.get("previousClose", 0)
         change = price - prev

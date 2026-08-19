@@ -13,12 +13,12 @@ python-telegram-bot==22.8
 google-genai==2.18.1
 
 # ─── Database (MongoDB) ──────────────────────────────────────────────────────
-motor>=3.5.0
-pymongo>=4.8.0
+motor==3.7.1
+pymongo==4.17.0
 
 # ─── Financial Data ──────────────────────────────────────────────────────────
-yfinance>=0.2.40
-pandas>=2.2.3
+yfinance==1.6.0
+pandas==3.0.5
 
 # ─── Background Jobs ─────────────────────────────────────────────────────────
 APScheduler==3.10.4

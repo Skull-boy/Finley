@@ -2,9 +2,11 @@
 Central configuration module.
 All settings loaded from environment variables via pydantic-settings.
 """
+import re
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 
 
 class Settings(BaseSettings):
@@ -53,9 +55,48 @@ class Settings(BaseSettings):
     bot_max_history: int = 12
     bot_max_memory_results: int = 5
 
+    # ─── Security ────────────────────────────────────────────────────────────
+    # Fernet key (base64, 32 bytes) used to encrypt OAuth token blobs at rest.
+    # Required in production; ephemeral key (with warning) otherwise.
+    token_encryption_key: str = ""
+    # Max tool-calling rounds per message. Each round can fan out multiple
+    # API calls, so a lower cap bounds the worst-case quota burn per message.
+    max_agentic_iterations: int = 3
+    # Comma-separated Telegram user IDs allowed to use the bot. Empty = open.
+    allowed_user_ids_raw: str = ""
+    # Per-user sliding-window message budget (protects shared API quota).
+    rate_limit_messages: int = 10
+    rate_limit_window_seconds: int = 60
+
+    @property
+    def allowed_user_ids(self) -> List[int]:
+        """Parse the comma-separated allowlist into a list of ints."""
+        return [
+            int(part)
+            for part in self.allowed_user_ids_raw.split(",")
+            if part.strip().isdigit()
+        ]
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    @model_validator(mode="after")
+    def _check_production_security(self):
+        """Fail fast on config that would violate policy in production."""
+        if self.is_production:
+            email = (self.sec_contact_email or "").strip()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise ValueError(
+                    "SEC_CONTACT_EMAIL must be a real contact email in production "
+                    "(SEC EDGAR requires it in the User-Agent)."
+                )
+            if not self.token_encryption_key.strip():
+                raise ValueError(
+                    "TOKEN_ENCRYPTION_KEY is required in production — OAuth tokens "
+                    "must be encrypted at rest."
+                )
+        return self
 
 
 @lru_cache

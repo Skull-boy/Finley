@@ -5,6 +5,7 @@ This is the brain — takes a user message and returns Finley's response.
 Handles: context building, memory retrieval, tool calling, response formatting.
 """
 import asyncio
+import logging
 import re
 from typing import Dict, Any, List, Optional
 
@@ -14,6 +15,8 @@ from ai.memory import get_memory_manager
 from ai.tools import FINANCIAL_TOOLS
 from db.crud import get_recent_history, save_message, get_user
 from config import settings
+
+logger = logging.getLogger("finbot")
 
 
 # ─── Tool-gating heuristics ───────────────────────────────────────────────────
@@ -92,7 +95,8 @@ class FinancialAgent:
                 relevant_memories = await memory_manager.search(
                     user_id, content, limit=settings.bot_max_memory_results
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug("Memory search failed for user %d: %s", user_id, e)
                 relevant_memories = []
 
         # ── 3. Get recent history ─────────────────────────────────────────────
@@ -148,8 +152,10 @@ class FinancialAgent:
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": assistant_msg},
             ])
-        except Exception:
-            pass  # Never crash on persistence failures
+        except Exception as e:
+            logger.warning(
+                "Message persistence/memory extraction failed for user %d: %s", user_id, e
+            )
 
 
 # ─── Utility functions ────────────────────────────────────────────────────────

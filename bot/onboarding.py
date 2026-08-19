@@ -140,7 +140,8 @@ async def _save_onboarding_data(user_id: int, data: Dict) -> None:
         profile_updates["role"] = data["role"]
 
     if data.get("watchlist"):
-        tickers = [t.upper().strip() for t in data["watchlist"] if t]
+        from security.validation import clean_ticker
+        tickers = [t for t in (clean_ticker(t) for t in data["watchlist"]) if t]
         if tickers:
             await add_to_watchlist(user_id, tickers)
 
@@ -169,11 +170,13 @@ async def _extract_partial_info(user_id: int, user_message: str, already_collect
 
     # Simple ticker detection (words that look like tickers: all caps, 1-5 letters)
     if not already_collected.get("watchlist"):
+        from security.validation import clean_ticker
         ticker_pattern = r'\b([A-Z]{1,5})\b'
         # Only extract if message mentions investing/tracking context
         if any(word in msg_lower for word in ["track", "follow", "watch", "own", "invested", "portfolio"]):
             potential_tickers = re.findall(ticker_pattern, user_message)
             common_words = {"I", "A", "THE", "AND", "OR", "IS", "IT", "MY", "ME", "WE", "US", "AT", "IN", "ON", "BE", "DO"}
             tickers = [t for t in potential_tickers if t not in common_words and len(t) >= 2]
+            tickers = [t for t in (clean_ticker(t) for t in tickers) if t]
             if tickers:
                 await add_to_watchlist(user_id, tickers)

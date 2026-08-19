@@ -40,8 +40,15 @@ class GeminiGateway:
         if not self.api_keys:
             raise ValueError("At least one Gemini API key required (GEMINI_API_KEY_1)")
 
-        # Create one client per key
-        self.clients = [genai.Client(api_key=k) for k in self.api_keys]
+        # Create one client per key (30s request timeout so a hung upstream
+        # can't occupy handler slots for the SDK's 600s default)
+        self.clients = [
+            genai.Client(
+                api_key=k,
+                http_options=types.HttpOptions(timeout=30_000),
+            )
+            for k in self.api_keys
+        ]
         self.current_index = 0
         self.cooldowns: Dict[int, float] = {}  # key_index → cooldown_until timestamp
         self._lock = asyncio.Lock()
@@ -200,7 +207,7 @@ class GeminiGateway:
         )
 
         response = await self._send_with_retry(chat, initial_prompt)
-        max_iterations = 5
+        max_iterations = max(1, settings.max_agentic_iterations)
 
         for _ in range(max_iterations):
             function_calls = []

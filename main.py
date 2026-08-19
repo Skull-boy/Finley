@@ -40,6 +40,46 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 telegram_app: Application = None
 
+# ─── Startup helpers ──────────────────────────────────────────────────────────
+
+
+async def _connect_db_with_retry(max_attempts: int = 5, base_delay: float = 2.0) -> None:
+    """Connect to MongoDB with exponential backoff — a brief DB outage at boot
+    must not kill the whole app."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await connect_db()
+            return
+        except Exception as e:
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.error(
+                "MongoDB connection failed (attempt %d/%d): %s — retrying in %.0fs",
+                attempt, max_attempts, e, delay,
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(delay)
+    raise RuntimeError("MongoDB unreachable after retries — giving up startup.")
+
+
+async def _start_polling_with_retry(app: Application, max_attempts: int = 5, base_delay: float = 2.0) -> None:
+    """Start Telegram long polling with retry/backoff on transient init errors."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await app.updater.start_polling(
+                drop_pending_updates=True,   # Ignore messages sent while bot was offline
+                allowed_updates=["message"],  # Only process messages (not edited, etc.)
+            )
+            return
+        except Exception as e:
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.error(
+                "Telegram polling start failed (attempt %d/%d): %s — retrying in %.0fs",
+                attempt, max_attempts, e, delay,
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(delay)
+    raise RuntimeError("Telegram polling could not be started after retries.")
+
 
 # ─── FastAPI Lifespan ─────────────────────────────────────────────────────────
 
@@ -50,8 +90,8 @@ async def lifespan(app: FastAPI):
 
     logger.info("🚀 Starting Finley Financial Assistant...")
 
-    # Connect to MongoDB
-    await connect_db()
+    # Connect to MongoDB (with retry/backoff)
+    await _connect_db_with_retry()
     logger.info("✅ MongoDB connected")
 
     # Build Telegram application
@@ -72,16 +112,14 @@ async def lifespan(app: FastAPI):
     # Start Telegram bot polling
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling(
-        drop_pending_updates=True,   # Ignore messages sent while bot was offline
-        allowed_updates=["message"],  # Only process messages (not edited, etc.)
-    )
+    await _start_polling_with_retry(telegram_app)
     logger.info("✅ Telegram bot polling started")
     # username is available after initialize()
     try:
         bot_username = telegram_app.bot.username
         logger.info(f"🤖 Finley is live! Bot: @{bot_username}")
-    except Exception:
+    except Exception as e:
+        logger.debug("Could not read bot username: %s", e)
         logger.info("🤖 Finley is live!")
 
     yield  # App is running
@@ -181,23 +219,56 @@ async def google_oauth_callback(code: str = "", state: str = "", error: str = ""
     if not code or not state:
         return HTMLResponse("<h2>Invalid callback parameters.</h2>", status_code=400)
 
-    try:
-        user_id = int(state)
-    except ValueError:
-        return HTMLResponse("<h2>Invalid state parameter.</h2>", status_code=400)
+    # State must be a valid, unexpired token issued by this app for this user —
+    # never a raw user ID (see security/state.py).
+    from security.state import verify_state
+    user_id = verify_state(state)
+    if user_id is None:
+        logger.warning(
+            "OAuth callback rejected: invalid/expired/forged state parameter "
+            "(len=%d).", len(state)
+        )
+        return HTMLResponse(
+            "<h2>Invalid or expired authorization link. Please start over from Telegram.</h2>",
+            status_code=400,
+        )
 
     try:
+        from db.crud import get_user
+        from db.models import is_google_connected
+
+        user = await get_user(user_id)
+        already_connected = is_google_connected(user)
+        if already_connected:
+            logger.info(
+                "OAuth re-auth rejected for user %d — already connected "
+                "(use /disconnect to revoke first).",
+                user_id,
+            )
+            return HTMLResponse("""
+                <html><body style="font-family: sans-serif; text-align: center; padding: 60px;">
+                <h2>Already Connected</h2>
+                <p>Your Google account is already linked to Finley.
+                Use <b>/disconnect</b> in Telegram first if you want to replace it.</p>
+                </body></html>
+            """)
+
         from services.google.gmail import exchange_code_for_tokens
+        from security.token_crypto import encrypt_token_blob
         from db.crud import update_user
 
         tokens = await exchange_code_for_tokens(code)
 
+        # Encrypt the token blob (includes refresh token + client_secret)
+        # before it ever touches MongoDB — never store plaintext credentials.
+        encrypted_tokens = encrypt_token_blob(tokens)
+
         # Save tokens to user's profile
         await update_user(user_id, {
             "integrations.gmail.connected": True,
-            "integrations.gmail.token": tokens,
+            "integrations.gmail.token": encrypted_tokens,
             "integrations.google_calendar.connected": True,
-            "integrations.google_calendar.token": tokens,
+            "integrations.google_calendar.token": encrypted_tokens,
         })
 
         # Notify user in Telegram

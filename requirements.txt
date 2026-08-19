@@ -9,15 +9,15 @@ python-telegram-bot==22.8
 google-genai==2.18.1
 
 # ─── Database ────────────────────────────────────────────────────────────────
-motor>=3.5.0               # Async MongoDB driver
-pymongo>=4.8.0             # Sync MongoDB (for APScheduler)
+motor==3.7.1               # Async MongoDB driver
+pymongo==4.17.0            # Sync MongoDB (for APScheduler)
 
 # ─── Vector Database ─────────────────────────────────────────────────────────
-qdrant-client>=1.9.2
+qdrant-client==1.19.0
 
 # ─── Financial Data ──────────────────────────────────────────────────────────
-yfinance>=0.2.40
-pandas>=2.2.3
+yfinance==1.6.0
+pandas==3.0.5
 
 # ─── Background Jobs ─────────────────────────────────────────────────────────
 APScheduler==3.10.4

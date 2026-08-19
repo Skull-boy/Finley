@@ -210,14 +210,22 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
     user_id is threaded through from the request context so concurrent
     users never share state.
     """
+    from security.validation import clean_ticker
+
+    def _ticker() -> str:
+        ticker = clean_ticker(args.get("ticker", ""))
+        if not ticker:
+            raise _InvalidTicker()
+        return ticker
+
     try:
         if tool_name == "get_stock_quote":
             from services.financial.market import get_stock_quote
-            return await get_stock_quote(args["ticker"])
+            return await get_stock_quote(_ticker())
 
         elif tool_name == "get_company_news":
             from services.financial.news import get_company_news
-            return await get_company_news(args["ticker"], args.get("days", 7))
+            return await get_company_news(_ticker(), args.get("days", 7))
 
         elif tool_name == "get_market_summary":
             from services.financial.market import get_market_summary
@@ -225,18 +233,18 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
 
         elif tool_name == "get_company_financials":
             from services.financial.fundamentals import get_company_financials
-            return await get_company_financials(args["ticker"])
+            return await get_company_financials(_ticker())
 
         elif tool_name == "get_earnings_calendar":
             from services.financial.earnings import get_earnings_calendar
             return await get_earnings_calendar(
                 days_ahead=args.get("days_ahead", 7),
-                ticker=args.get("ticker")
+                ticker=_ticker() if args.get("ticker") else None
             )
 
         elif tool_name == "search_sec_filings":
             from services.financial.sec_edgar import search_sec_filings
-            return await search_sec_filings(args["ticker"], args.get("filing_type", ""))
+            return await search_sec_filings(_ticker(), args.get("filing_type", ""))
 
         elif tool_name == "get_market_news":
             from services.financial.news import get_market_news
@@ -247,16 +255,39 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
                 from db.crud import add_to_watchlist
                 tickers = args.get("tickers", [])
                 if tickers:
-                    await add_to_watchlist(user_id, tickers)
-                    return f"Added {', '.join(tickers)} to your watchlist."
+                    added = await add_to_watchlist(user_id, tickers)
+                    if added == 0:
+                        return "Couldn't add those to your watchlist — invalid tickers, or the watchlist is full (max 50)."
+                    return f"Added {', '.join(tickers[:added])} to your watchlist."
             return "Could not add to watchlist — user context missing."
 
         elif tool_name == "set_price_alert":
             if user_id:
-                from db.crud import create_alert
-                ticker = args["ticker"].upper()
-                threshold = float(args["threshold"])
-                direction = args["direction"]
+                from db.crud import create_alert, get_active_alerts
+                from security.validation import (
+                    clean_ticker, is_valid_direction, is_valid_threshold, MAX_ALERTS_PER_USER
+                )
+                ticker = clean_ticker(args.get("ticker", ""))
+                direction = args.get("direction", "")
+                try:
+                    threshold = float(args["threshold"])
+                except (KeyError, TypeError, ValueError):
+                    threshold = float("nan")
+
+                if not ticker:
+                    return "I couldn't set that alert — please use a valid stock ticker (e.g. AAPL)."
+                if not is_valid_threshold(threshold):
+                    return "I couldn't set that alert — the price threshold must be a positive number."
+                if not is_valid_direction(direction):
+                    return "I couldn't set that alert — direction must be 'above' or 'below'."
+
+                existing = await get_active_alerts(user_id)
+                if len(existing) >= MAX_ALERTS_PER_USER:
+                    return (
+                        f"You already have {MAX_ALERTS_PER_USER} active alerts — "
+                        "deactivate some before adding more."
+                    )
+
                 await create_alert(
                     user_id,
                     f"price_{direction}",
@@ -283,15 +314,20 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
 
         elif tool_name == "compare_companies":
             from services.financial.fundamentals import compare_companies
-            return await compare_companies(args["tickers"])
+            tickers = [t for t in (clean_ticker(t) for t in args.get("tickers", [])) if t]
+            if not tickers:
+                raise _InvalidTicker()
+            return await compare_companies(tickers)
 
         elif tool_name == "get_analyst_ratings":
             from services.financial.fundamentals import get_analyst_ratings
-            return await get_analyst_ratings(args["ticker"])
+            return await get_analyst_ratings(_ticker())
 
         else:
             return f"Unknown tool: {tool_name}"
 
+    except _InvalidTicker:
+        return "That doesn't look like a valid stock ticker — ask the user to confirm the ticker symbol."
     except KeyError as e:
         return f"Tool {tool_name} called with missing required argument: {e}"
     except Exception as e:
@@ -300,3 +336,7 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
 
 # ─── Exported Tools Object ────────────────────────────────────────────────────
 FINANCIAL_TOOLS = _make_tools()
+
+
+class _InvalidTicker(Exception):
+    """Raised internally when a tool receives an invalid ticker format."""
