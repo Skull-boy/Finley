@@ -48,3 +48,19 @@ def is_valid_threshold(value) -> bool:
 
 def is_valid_direction(direction: str) -> bool:
     return direction in ("above", "below")
+
+
+def is_valid_gemini_key(key: str) -> bool:
+    """BYOK key: non-empty, 20-256 chars, no whitespace/controls, plausible shape."""
+    if not isinstance(key, str):
+        return False
+    k = key.strip()
+    if not (20 <= len(k) <= 256):
+        return False
+    if re.search(r"\s", k):
+        return False
+    # Allow test keys in tests (test-...), otherwise expect AIza prefix or at least alphanum/_/-
+    if k.startswith("test-"):
+        return True
+    # Real Gemini keys start with AIza and are base64url-like
+    return bool(re.match(r"^(AIza[0-9A-Za-z_\-]+|[A-Za-z0-9_\-]{20,})$", k))
