@@ -50,15 +50,27 @@ def get_db() -> AsyncIOMotorDatabase:
 
 # ─── User Operations ──────────────────────────────────────────────────────────
 
-async def get_or_create_user(telegram_id: int, username: str = "", first_name: str = "") -> Dict[str, Any]:
+async def get_or_create_user(telegram_id: int, username: str = "", first_name: str = "", language_code: str = "") -> Dict[str, Any]:
     """Get existing user or create new one. Returns user dict."""
     db = get_db()
     user = await db.users.find_one({"telegram_id": telegram_id})
     if not user:
         user_doc = new_user(telegram_id, username, first_name)
+        if language_code:
+            user_doc["profile"]["language"] = language_code[:10]
         result = await db.users.insert_one(user_doc)
         user_doc["_id"] = result.inserted_id
         return user_doc
+    # Update language if Telegram reports a new one (best-effort, no await blocker)
+    if language_code and user.get("profile", {}).get("language") != language_code[:10]:
+        try:
+            await db.users.update_one(
+                {"telegram_id": telegram_id},
+                {"$set": {"profile.language": language_code[:10], "last_active": datetime.utcnow()}},
+            )
+            user["profile"]["language"] = language_code[:10]
+        except Exception:
+            pass
     return user
 
 
@@ -185,6 +197,15 @@ async def get_active_alerts(telegram_id: int) -> List[Dict[str, Any]]:
     return await cursor.to_list(length=None)
 
 
+async def get_alert_by_id(alert_id: str) -> Optional[Dict[str, Any]]:
+    """Get a single alert by its ObjectId string."""
+    try:
+        from bson import ObjectId
+        return await get_db().alerts.find_one({"_id": ObjectId(alert_id)})
+    except Exception:
+        return None
+
+
 async def get_all_active_alerts() -> List[Dict[str, Any]]:
     """Get all active alerts across all users (for scheduler)."""
     cursor = get_db().alerts.find({"active": True})
@@ -207,3 +228,122 @@ async def mark_alert_triggered(alert_id: str) -> None:
         {"_id": ObjectId(alert_id)},
         {"$inc": {"triggered_count": 1}, "$set": {"last_triggered": datetime.utcnow()}}
     )
+
+
+# ─── GDPR / Data-control Operations (Phase 0) ───────────────────────────────
+
+async def clear_user_memories(telegram_id: int) -> int:
+    """
+    Forget everything Finley remembers about this user (GDPR 'forget').
+    Clears vector memories + summary. Returns count of memories removed.
+    """
+    user = await get_db().users.find_one(
+        {"telegram_id": telegram_id}, {"memories": 1}
+    )
+    count = len(user.get("memories", [])) if user else 0
+    await get_db().users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"memories": [], "memory_summary": ""}}
+    )
+    # Also purge Qdrant vectors (best-effort, not fatal if Qdrant down)
+    try:
+        from ai.memory import get_memory_manager
+        await get_memory_manager().delete_user_memories(telegram_id)
+    except Exception:
+        pass
+    return count
+
+
+async def delete_user_messages(telegram_id: int) -> int:
+    """Delete all conversation history for a user. Returns deleted count."""
+    result = await get_db().messages.delete_many({"user_id": telegram_id})
+    return result.deleted_count
+
+
+async def delete_user_alerts(telegram_id: int) -> int:
+    """Delete all alerts for a user. Returns deleted count."""
+    result = await get_db().alerts.delete_many({"user_id": telegram_id})
+    return result.deleted_count
+
+
+async def delete_all_user_data(telegram_id: int) -> Dict[str, int]:
+    """
+    Hard-delete every trace of a user (GDPR right-to-erasure).
+    Covers: user doc, messages, alerts, Qdrant vectors.
+    Returns counts per collection.
+    """
+    db = get_db()
+    # Qdrant purge first (while we still know user_id)
+    try:
+        from ai.memory import get_memory_manager
+        await get_memory_manager().delete_user_memories(telegram_id)
+    except Exception:
+        pass
+
+    msg_res = await db.messages.delete_many({"user_id": telegram_id})
+    alert_res = await db.alerts.delete_many({"user_id": telegram_id})
+    user_res = await db.users.delete_one({"telegram_id": telegram_id})
+
+    return {
+        "users": user_res.deleted_count,
+        "messages": msg_res.deleted_count,
+        "alerts": alert_res.deleted_count,
+    }
+
+
+# ─── BYOK (Phase 1: bring your own Gemini key) ────────────────────────────
+
+async def set_byok_key(telegram_id: int, raw_key: str) -> None:
+    """
+    Store a per-user Gemini key encrypted at rest.
+    Overwrites any existing BYOK. Caller must validate via is_valid_gemini_key.
+    """
+    from security.token_crypto import encrypt_token_blob
+    blob = encrypt_token_blob({"k": raw_key.strip()})
+    await get_db().users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {
+            "integrations.byok.has_key": True,
+            "integrations.byok.key_encrypted": blob,
+            "integrations.byok.added_at": datetime.utcnow(),
+        }},
+    )
+
+
+async def clear_byok_key(telegram_id: int) -> bool:
+    """Remove BYOK. Returns True if a key was present."""
+    user = await get_db().users.find_one(
+        {"telegram_id": telegram_id}, {"integrations.byok": 1}
+    )
+    had = bool((user or {}).get("integrations", {}).get("byok", {}).get("has_key"))
+    await get_db().users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {
+            "integrations.byok.has_key": False,
+            "integrations.byok.key_encrypted": None,
+            "integrations.byok.added_at": None,
+        }},
+    )
+    return had
+
+
+async def get_byok_key(telegram_id: int) -> Optional[str]:
+    """
+    Decrypt and return the user's BYOK Gemini key, or None.
+    Never logs the key — caller must treat as secret.
+    """
+    user = await get_db().users.find_one(
+        {"telegram_id": telegram_id}, {"integrations.byok": 1}
+    )
+    byok = (user or {}).get("integrations", {}).get("byok", {}) or {}
+    if not byok.get("has_key"):
+        return None
+    blob = byok.get("key_encrypted")
+    if not blob or not isinstance(blob, str):
+        return None
+    try:
+        from security.token_crypto import decrypt_token_blob
+        data = decrypt_token_blob(blob)
+        return data.get("k") if isinstance(data, dict) else None
+    except Exception:
+        return None

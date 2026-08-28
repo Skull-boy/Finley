@@ -49,6 +49,7 @@ def new_user(telegram_id: int, username: str = "", first_name: str = "") -> Dict
             "interests": [],                  # e.g., ["AI", "semiconductors", "macro"]
             "briefing_time": None,            # e.g., "08:00"
             "timezone": "America/New_York",
+            "language": "en",                # Telegram language_code, e.g. en, hi, ja
             "response_style": "concise",      # concise | detailed
             "preferred_markets": ["US"],      # US, EU, Asia
         },
@@ -61,6 +62,7 @@ def new_user(telegram_id: int, username: str = "", first_name: str = "") -> Dict
             "gmail": {"connected": False, "token": None, "email": None},
             "google_calendar": {"connected": False, "token": None},
             "google_drive": {"connected": False, "token": None},
+            "byok": {"has_key": False, "key_encrypted": None, "added_at": None},
         },
         "created_at": datetime.utcnow(),
         "last_active": datetime.utcnow(),
