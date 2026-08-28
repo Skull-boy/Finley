@@ -155,30 +155,67 @@ async def _evaluate_alert(bot: Bot, alert: Dict, current_price: float) -> None:
             )
 
 
+MAX_TICKERS_PER_RUN = 80
+MAX_CONCURRENT_FETCHES = 8
+
 async def _get_batch_prices(tickers: List[str]) -> Dict[str, float]:
-    """Fetch current prices for multiple tickers efficiently."""
-    prices = {}
+    """Fetch current prices for multiple tickers efficiently, bounded (Phase 2 A04)."""
+    from services.financial.cache import get_cached, set_cached
+
+    if not tickers:
+        return {}
+    if len(tickers) > MAX_TICKERS_PER_RUN:
+        logger.warning(
+            "Alert job: %d tickers, capping to %d to protect Finnhub quota",
+            len(tickers), MAX_TICKERS_PER_RUN,
+        )
+        tickers = tickers[:MAX_TICKERS_PER_RUN]
+
+    prices: Dict[str, float] = {}
+    to_fetch: List[str] = []
+    for t in tickers:
+        cached = get_cached(f"alert_price:{t}")
+        if cached is not None:
+            try:
+                prices[t] = float(cached)
+            except Exception:
+                to_fetch.append(t)
+        else:
+            to_fetch.append(t)
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
     async def _fetch_one(ticker: str):
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(
-                    f"{FINNHUB_BASE}/quote",
-                    params={"symbol": ticker, "token": settings.finnhub_api_key}
-                )
-                data = r.json()
-                price = data.get("c")
-                if price and price > 0:
-                    prices[ticker] = price
-        except Exception:
-            pass
+        async with sem:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(
+                        f"{FINNHUB_BASE}/quote",
+                        params={"symbol": ticker, "token": settings.finnhub_api_key}
+                    )
+                    data = r.json()
+                    price = data.get("c")
+                    if price and price > 0:
+                        prices[ticker] = float(price)
+                        set_cached(f"alert_price:{ticker}", float(price), ttl=60)
+            except Exception:
+                pass
 
-    await asyncio.gather(*[_fetch_one(t) for t in tickers])
+    if to_fetch:
+        await asyncio.gather(*[_fetch_one(t) for t in to_fetch])
     return prices
 
 
 async def _get_daily_change_pct(ticker: str) -> float:
-    """Get today's percentage change for a ticker."""
+    """Get today's percentage change for a ticker (cached 60s)."""
+    from services.financial.cache import get_cached, set_cached
+    ck = f"alert_dp:{ticker}"
+    hit = get_cached(ck)
+    if hit is not None:
+        try:
+            return float(hit)
+        except Exception:
+            pass
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get(
@@ -186,6 +223,8 @@ async def _get_daily_change_pct(ticker: str) -> float:
                 params={"symbol": ticker, "token": settings.finnhub_api_key}
             )
             data = r.json()
-            return data.get("dp", 0)  # dp = daily percent change
+            dp = float(data.get("dp", 0) or 0)
+            set_cached(ck, dp, ttl=60)
+            return dp
     except Exception:
         return 0

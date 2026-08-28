@@ -6,8 +6,10 @@ naturally. We just track what info has been collected and feed it back
 as context so Gemini knows what's still needed.
 
 No state machine, no buttons — just natural conversation.
+Phase 1 polish: timezone auto-detect + quick-start follow-up.
 """
 import json
+import logging
 import re
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,13 +20,81 @@ from ai.gateway import get_gateway
 from ai.prompts import build_onboarding_prompt
 from db.crud import update_user, update_user_profile, add_to_watchlist, save_message
 
+logger = logging.getLogger("finbot")
+
+# ─── Timezone inference (best-effort, never trusted blindly) ────────────────
+
+_LANG_TZ_MAP = {
+    "en-IN": "Asia/Kolkata",
+    "en-GB": "Europe/London",
+    "en-AU": "Australia/Sydney",
+    "en-SG": "Asia/Singapore",
+    "en-AE": "Asia/Dubai",
+    "en-US": "America/New_York",
+    "en-CA": "America/Toronto",
+    "en-NZ": "Pacific/Auckland",
+    "ja": "Asia/Tokyo",
+    "ko": "Asia/Seoul",
+    "zh": "Asia/Shanghai",
+    "de": "Europe/Berlin",
+    "fr": "Europe/Paris",
+    "es": "Europe/Madrid",
+    "it": "Europe/Rome",
+    "pt-BR": "America/Sao_Paulo",
+    "pt": "Europe/Lisbon",
+    "ru": "Europe/Moscow",
+    "ar": "Asia/Dubai",
+    "hi": "Asia/Kolkata",
+}
+
+_CITY_TZ_HINTS = {
+    # low-precision hints from city mentions — only used if user mentions city
+    "mumbai": "Asia/Kolkata",
+    "delhi": "Asia/Kolkata",
+    "kolkata": "Asia/Kolkata",
+    "bangalore": "Asia/Kolkata",
+    "london": "Europe/London",
+    "new york": "America/New_York",
+    "boston": "America/New_York",
+    "san francisco": "America/Los_Angeles",
+    "tokyo": "Asia/Tokyo",
+    "singapore": "Asia/Singapore",
+    "dubai": "Asia/Dubai",
+    "berlin": "Europe/Berlin",
+    "paris": "Europe/Paris",
+}
+
+
+def _infer_timezone(update: Update, current: Optional[str] = None) -> str:
+    """Infer timezone from Telegram language_code + any city hint. Returns IANA tz."""
+    if current:
+        return current
+    lang = (getattr(update.effective_user, "language_code", None) or "").strip()
+    # Direct map
+    if lang in _LANG_TZ_MAP:
+        return _LANG_TZ_MAP[lang]
+    # Fallback by primary lang
+    primary = lang.split("-")[0].lower() if lang else ""
+    for k, v in _LANG_TZ_MAP.items():
+        if k.startswith(primary + "-") or k == primary:
+            return v
+    # Try city hint from recent text (very weak, but better than NY default for Indian users)
+    try:
+        text = (update.message.text or "").lower()
+        for city, tz in _CITY_TZ_HINTS.items():
+            if city in text:
+                return tz
+    except Exception:
+        pass
+    return "America/New_York"
+
 
 async def handle_onboarding_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     user: Dict[str, Any],
     text_override: str = ""
-) -> str:
+) -> Tuple[str, bool]:
     """
     Handle a message from a user in onboarding mode.
 
@@ -32,14 +102,13 @@ async def handle_onboarding_message(
         text_override: For voice messages — the transcription to use as the message text
 
     Returns:
-        The AI response to send to the user.
-        If onboarding is complete, also updates the database.
+        (response_text, completed) — completed True when onboarding just finished.
     """
     user_id = update.effective_user.id
     user_message = (text_override or update.message.text or "").strip()
 
     if not user_message:
-        return "I heard your message but couldn't read it. Could you type it instead?"
+        return "I heard your message but couldn't read it. Could you type it instead?", False
 
     # Get what we've collected so far from user profile
     profile = user.get("profile", {})
@@ -92,14 +161,17 @@ async def handle_onboarding_message(
             flags=re.DOTALL
         ).strip()
 
-        # Persist the collected profile data
+        # Persist the collected profile data (with timezone inference)
+        # Attach inferred tz before saving so briefing job works even if LLM left it blank
+        if not onboarding_data.get("timezone"):
+            onboarding_data["timezone"] = _infer_timezone(update)
         await _save_onboarding_data(user_id, onboarding_data)
 
         # Save messages
         await save_message(user_id, "user", user_message)
         await save_message(user_id, "assistant", clean_response)
 
-        return clean_response
+        return clean_response, True
 
     # Not complete yet — save messages and continue
     await save_message(user_id, "user", user_message)
@@ -108,7 +180,7 @@ async def handle_onboarding_message(
     # Try to extract partial info from the conversation to persist incrementally
     await _extract_partial_info(user_id, user_message, collected)
 
-    return response
+    return response, False
 
 
 def _extract_onboarding_completion(response: str) -> Optional[Dict]:

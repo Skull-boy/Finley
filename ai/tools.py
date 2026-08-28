@@ -263,10 +263,11 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
 
         elif tool_name == "set_price_alert":
             if user_id:
-                from db.crud import create_alert, get_active_alerts
+                from db.crud import create_alert, get_active_alerts, get_user
                 from security.validation import (
-                    clean_ticker, is_valid_direction, is_valid_threshold, MAX_ALERTS_PER_USER
+                    clean_ticker, is_valid_direction, is_valid_threshold,
                 )
+                from security.tiers import alert_limit_for
                 ticker = clean_ticker(args.get("ticker", ""))
                 direction = args.get("direction", "")
                 try:
@@ -281,10 +282,21 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
                 if not is_valid_direction(direction):
                     return "I couldn't set that alert — direction must be 'above' or 'below'."
 
+                # Phase 3 tiered alert cap (free 5, pro 50)
+                try:
+                    user = await get_user(user_id)
+                except Exception:
+                    user = None
+                limit = alert_limit_for(user, user_id)
                 existing = await get_active_alerts(user_id)
-                if len(existing) >= MAX_ALERTS_PER_USER:
+                if len(existing) >= limit:
+                    if limit <= 5:
+                        return (
+                            f"You have {len(existing)}/{limit} alerts (Free tier). "
+                            f"Add /byok for 50 alerts or delete one via /alerts."
+                        )
                     return (
-                        f"You already have {MAX_ALERTS_PER_USER} active alerts — "
+                        f"You already have {limit} active alerts — "
                         "deactivate some before adding more."
                     )
 

@@ -2,9 +2,9 @@
 
 > Talk to Finley like an analyst. It answers with live market data — no commands, no dashboards, no jargon.
 
-Finley is a Telegram-native AI assistant that pairs Gemini's reasoning with real-time financial data from Finnhub, yfinance, and SEC EDGAR — backed by persistent semantic memory. Ask about any stock, send a voice note, drop in a PDF or an earnings chart, and Finley researches it, remembers your preferences, and proactively keeps an eye on your portfolio with price alerts and personalized morning briefings.
+Finley is a Telegram-native AI assistant that pairs Gemini with real-time data from Finnhub, yfinance, and SEC EDGAR, backed by persistent semantic memory. Ask about any stock, send a voice note or drop in a PDF — Finley researches it, remembers you, and watches your portfolio with price alerts and morning briefings.
 
-Built entirely on free tiers: Google Gemini with automatic multi-key rotation, MongoDB + Qdrant (local Docker or cloud), and zero paid APIs.
+Runs on a 100% free-tier stack: Gemini with multi-key rotation, MongoDB + Qdrant (local Docker or cloud), no paid APIs.
 
 [![Finley: Your AI Financial Co-Pilot for Telegram](https://repoclip.io/api/badge/7e3f4714-2259-4daa-a32e-f7aff6dfa4ee)](https://repoclip.io/v/7e3f4714-2259-4daa-a32e-f7aff6dfa4ee)
 
@@ -38,7 +38,7 @@ cp .env.example .env
 ### 4. Run
 ```bash
 python main.py
-# Bot polls Telegram; FastAPI serves /health on :8000
+# Polling (dev) or webhook (prod via TELEGRAM_WEBHOOK_URL); FastAPI /health on :8000
 ```
 
 ---
@@ -61,7 +61,7 @@ usage at https://ai.dev/rate-limit. Multi-key rotation multiplies your quota.
 ## 🏗️ Project Structure
 
 ```
-hackathon/
+Finley/
 ├── main.py                   # FastAPI + Telegram bot entry point
 ├── config.py                 # Pydantic settings (loads from .env)
 ├── Dockerfile                # Container image (Render deploy)
@@ -75,23 +75,30 @@ hackathon/
 │   └── ci.yml                # CI: compile check + offline pytest
 │
 ├── ai/
-│   ├── gateway.py            # Multi-key Gemini gateway: retries, rotation,
-│   │                         #   embeddings, files API (google-genai SDK)
-│   ├── agent.py              # Main AI orchestrator (tool-gating by intent)
-│   ├── prompts.py            # System prompts (analyst, onboarding, briefing)
-│   ├── memory.py             # Semantic memory (Qdrant + MongoDB fallback)
-│   └── tools.py              # Gemini function-calling tool definitions
+│   ├── gateway.py            # Multi-key pool + BYOK isolated + rotation + Files API
+│   ├── agent.py              # Orchestrator + injection guard (LLM01/02)
+│   ├── prompts.py            # Prompts + i18n hint
+│   ├── memory.py             # Qdrant + Mongo fallback + GDPR purge
+│   └── tools.py              # Tools + tiered alert caps (5/50)
 │
 ├── bot/
-│   ├── handlers.py           # Telegram message handlers (text, voice, docs)
-│   └── onboarding.py         # Conversational onboarding flow
+│   ├── handlers.py           # Handlers: text/voice/docs + /byok /briefing /alerts + GDPR
+│   └── onboarding.py         # Onboarding + TZ inference + quick-start buttons
 │
 ├── db/
-│   ├── models.py             # MongoDB document schemas
-│   └── crud.py               # Async CRUD operations
+│   ├── models.py             # Schemas + byok + language
+│   └── crud.py               # CRUD + GDPR + BYOK encryption
+│
+├── security/
+│   ├── sanitize.py           # Strip controls + injection detect + HTML allowlist
+│   ├── tiers.py              # Free 20/day / Pro 200/day (Redis optional)
+│   ├── rate_limit.py         # Per-user sliding window (10/60s)
+│   ├── state.py              # HMAC-signed OAuth state
+│   └── token_crypto.py       # Fernet + rotation
 │
 ├── services/
 │   ├── financial/
+│   │   ├── cache.py          # TTL cache (60s) + Redis optional
 │   │   ├── market.py         # Real-time stock quotes + market overview
 │   │   ├── news.py           # Company and market news (Finnhub)
 │   │   ├── fundamentals.py   # Company financials + comparison (yfinance)
@@ -121,7 +128,7 @@ hackathon/
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/ -v
+python -m pytest tests/ -v   # 130 passed (offline, mocked — no keys/DB needed)
 ```
 
 All tests are offline (mocked) — they run in CI on every push/PR via

@@ -11,6 +11,7 @@ import httpx
 import yfinance as yf
 
 from config import settings
+from services.financial.cache import get_cached, set_cached
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -19,8 +20,13 @@ async def get_stock_quote(ticker: str) -> str:
     """
     Get real-time stock quote for a ticker.
     Returns a formatted string with price, change, and key metrics.
+    Cached 60s (OWASP A04 quota).
     """
     ticker = ticker.upper().strip()
+    cache_key = f"quote:{ticker}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -44,11 +50,14 @@ async def get_stock_quote(ticker: str) -> str:
         direction = "▲" if change >= 0 else "▼"
         sign = "+" if change >= 0 else ""
 
-        return (
+        result = (
             f"<code>{ticker}</code> — <b>${current:,.2f}</b>\n"
             f"{direction} {sign}${change:.2f} ({sign}{change_pct:.2f}%)\n"
             f"High: ${high:,.2f} | Low: ${low:,.2f} | Prev Close: ${prev_close:,.2f}"
         )
+        # Only cache valid prices (not error strings)
+        set_cached(cache_key, result, ttl=60)
+        return result
 
     except Exception:
         return await _yfinance_quote_fallback(ticker)
@@ -82,7 +91,11 @@ def _get_yf_info(ticker: str) -> Dict:
 
 
 async def get_market_summary() -> str:
-    """Get a snapshot of major market indices and sentiment."""
+    """Get a snapshot of major market indices and sentiment. Cached 60s."""
+    cache_key = "market:summary"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
     indices = {
         "^GSPC": "S&P 500",
         "^IXIC": "NASDAQ",
@@ -113,4 +126,7 @@ async def get_market_summary() -> str:
     lines.extend(results)
     lines.append(f"\n<i>Updated: {datetime.utcnow().strftime('%H:%M UTC')}</i>")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if "unavailable" not in result:
+        set_cached(cache_key, result, ttl=60)
+    return result

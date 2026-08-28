@@ -9,18 +9,23 @@ from typing import Optional
 import httpx
 
 from config import settings
+from services.financial.cache import get_cached, set_cached
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 
 async def get_earnings_calendar(days_ahead: int = 7, ticker: Optional[str] = None) -> str:
     """
-    Get upcoming earnings announcements.
+    Get upcoming earnings announcements. Cached 10 min.
 
     Args:
         days_ahead: How many days ahead to look
         ticker: If specified, show only this company's earnings
     """
+    cache_key = f"earnings:{ticker or 'all'}:{days_ahead}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
     from_date = datetime.utcnow().strftime("%Y-%m-%d")
     to_date = (datetime.utcnow() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
@@ -68,33 +73,37 @@ async def get_earnings_calendar(days_ahead: int = 7, ticker: Optional[str] = Non
             if rev_est:
                 from services.financial.fundamentals import _format_large_number
                 result += f"• Revenue Estimate: <b>{_format_large_number(rev_est)}</b>\n"
+            if "Could not retrieve" not in result:
+                set_cached(cache_key, result, ttl=600)
             return result
 
-        else:
-            # Multi-company calendar
-            lines = [f"<b>📅 Earnings Calendar — Next {days_ahead} Days</b>\n"]
-            current_date = ""
+        # Multi-company calendar
+        lines = [f"<b>📅 Earnings Calendar — Next {days_ahead} Days</b>\n"]
+        current_date = ""
 
-            for e in earnings_list[:15]:  # Cap at 15 to avoid long messages
-                date = e.get("date", "")
-                symbol = e.get("symbol", "")
-                hour = "🌅" if e.get("hour") == "bmo" else \
-                       "🌙" if e.get("hour") == "amc" else ""
-                eps_est = e.get("epsEstimate")
-                eps_str = f" (est. EPS: ${eps_est:.2f})" if eps_est else ""
+        for e in earnings_list[:15]:  # Cap at 15 to avoid long messages
+            date = e.get("date", "")
+            symbol = e.get("symbol", "")
+            hour = "🌅" if e.get("hour") == "bmo" else \
+                   "🌙" if e.get("hour") == "amc" else ""
+            eps_est = e.get("epsEstimate")
+            eps_str = f" (est. EPS: ${eps_est:.2f})" if eps_est else ""
 
-                if date != current_date:
-                    current_date = date
-                    # Format date nicely
-                    try:
-                        dt = datetime.strptime(date, "%Y-%m-%d")
-                        lines.append(f"\n<b>{dt.strftime('%A, %b %d')}</b>")
-                    except Exception:
-                        lines.append(f"\n<b>{date}</b>")
+            if date != current_date:
+                current_date = date
+                # Format date nicely
+                try:
+                    dt = datetime.strptime(date, "%Y-%m-%d")
+                    lines.append(f"\n<b>{dt.strftime('%A, %b %d')}</b>")
+                except Exception:
+                    lines.append(f"\n<b>{date}</b>")
 
-                lines.append(f"  {hour} <code>{symbol}</code>{eps_str}")
+            lines.append(f"  {hour} <code>{symbol}</code>{eps_str}")
 
-            return "\n".join(lines)
+        result = "\n".join(lines)
+        if "Could not retrieve" not in result:
+            set_cached(cache_key, result, ttl=600)
+        return result
 
     except Exception as e:
         return f"Could not retrieve earnings calendar: {str(e)}"

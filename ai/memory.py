@@ -238,6 +238,22 @@ Return ONLY the updated summary text."""
         recent = sorted(memories, key=_sort_key, reverse=True)
         return [m["text"] for m in recent[:limit]]
 
+    async def delete_user_memories(self, user_id: int) -> None:
+        """Delete all Qdrant vectors for a user (GDPR). No-op if Qdrant not ready."""
+        if not self._qdrant_ready or not self._qdrant_client:
+            return
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            await asyncio.to_thread(
+                self._qdrant_client.delete,
+                collection_name=self._collection_name,
+                points_selector=Filter(
+                    must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+                ),
+            )
+        except Exception:
+            pass  # Best-effort — Mongo is source of truth
+
     async def _update_summary(self, user_id: int, new_facts: List[str]) -> None:
         """Update the user's memory summary with newly extracted facts."""
         try:

@@ -10,6 +10,7 @@ import httpx
 import yfinance as yf
 
 from config import settings
+from services.financial.cache import get_cached, set_cached
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -23,8 +24,13 @@ async def get_company_financials(ticker: str) -> str:
     """
     Get comprehensive company fundamentals.
     Covers: profile, valuation, profitability, growth, balance sheet.
+    Cached 5 min (yfinance is slow + hammerable — OWASP A04).
     """
     ticker = ticker.upper().strip()
+    cache_key = f"fundamentals:{ticker}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
 
     try:
         # yfinance has no timeout of its own — bound it so a slow Yahoo
@@ -74,7 +80,7 @@ async def get_company_financials(ticker: str) -> str:
         wk52_high = info.get("fiftyTwoWeekHigh") or 0
         wk52_low = info.get("fiftyTwoWeekLow") or 0
 
-        return (
+        result = (
             f"<b>📊 {name} ({ticker}) — Fundamentals</b>\n\n"
             f"<b>Overview</b>\n"
             f"• Sector: {sector} | Industry: {industry}\n"
@@ -92,14 +98,20 @@ async def get_company_financials(ticker: str) -> str:
             f"<b>Balance Sheet</b>\n"
             f"• Cash: {cash} | Debt: {debt} | D/E: {debt_equity}"
         )
+        set_cached(cache_key, result, ttl=300)
+        return result
 
     except Exception as e:
         return f"Error fetching fundamentals for {ticker}: {str(e)}"
 
 
 async def compare_companies(tickers: List[str]) -> str:
-    """Compare multiple companies across key financial metrics."""
+    """Compare multiple companies across key financial metrics. Cached 5 min."""
     tickers = [t.upper().strip() for t in tickers[:4]]  # Max 4 companies
+    cache_key = f"compare:{':'.join(sorted(tickers))}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
 
     async def _get_metrics(ticker: str) -> Optional[Dict]:
         try:
@@ -160,12 +172,19 @@ async def compare_companies(tickers: List[str]) -> str:
                 values.append(str(val))
         lines.append(f"<i>{label}</i>: {' | '.join(values)}")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if "Could not retrieve" not in result:
+        set_cached(cache_key, result, ttl=300)
+    return result
 
 
 async def get_analyst_ratings(ticker: str) -> str:
-    """Get latest analyst ratings and price targets from Finnhub."""
+    """Get latest analyst ratings and price targets from Finnhub. Cached 10m."""
     ticker = ticker.upper().strip()
+    cache_key = f"ratings:{ticker}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
@@ -202,7 +221,7 @@ async def get_analyst_ratings(ticker: str) -> str:
         else:
             consensus = "Sell"
 
-        return (
+        result = (
             f"<b>📈 Analyst Ratings: {ticker}</b> <i>({period})</i>\n\n"
             f"Consensus: <b>{consensus}</b> ({total} analysts)\n\n"
             f"• 💚 Strong Buy: {strong_buy}\n"
@@ -211,6 +230,8 @@ async def get_analyst_ratings(ticker: str) -> str:
             f"• 🔴 Sell: {sell}\n"
             f"• ❌ Strong Sell: {strong_sell}"
         )
+        set_cached(cache_key, result, ttl=600)
+        return result
 
     except Exception:
         return f"Could not retrieve analyst ratings for {ticker}."

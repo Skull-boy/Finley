@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 import httpx
 
 from config import settings
+from services.financial.cache import get_cached, set_cached
 
 SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
 
@@ -54,8 +55,13 @@ async def search_sec_filings(ticker: str, filing_type: str = "") -> str:
     """
     Search for recent SEC filings for a company.
     Returns formatted list of recent filings with links.
+    Cached 10 min (EDGAR is stable).
     """
     ticker = ticker.upper().strip()
+    cache_key = f"edgar:{ticker}:{(filing_type or 'all').upper()}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
 
     cik = await get_company_cik(ticker)
     if not cik:
@@ -107,7 +113,10 @@ async def search_sec_filings(ticker: str, filing_type: str = "") -> str:
             form_description = _filing_description(form)
             lines.append(f"• <b>{form}</b> ({date}) — {form_description}\n  <a href='{url}'>View Filing →</a>")
 
-        return "\n\n".join([lines[0]] + lines[1:])
+        result = "\n\n".join([lines[0]] + lines[1:])
+        if not result.startswith("Error searching"):
+            set_cached(cache_key, result, ttl=600)
+        return result
 
     except Exception as e:
         return f"Error searching SEC filings for {ticker}: {str(e)}"

@@ -172,3 +172,45 @@ async def get_email_count(token_data: Dict, query: str) -> int:
     except Exception as e:
         logger.warning("Gmail count lookup failed: %s", e)
         return 0
+
+
+async def revoke_google_token(token_data) -> bool:
+    """
+    Revoke a Google OAuth token server-side (OWASP A01 - proper session termination).
+    Called on /disconnect before deleting the stored blob.
+    Returns True if revoke was attempted (even if token already invalid).
+    Best-effort — failure is logged but doesn't block local disconnect.
+    """
+    # Extract raw token string (access or refresh) — either revokes the grant
+    raw = None
+    try:
+        if isinstance(token_data, str):
+            from security.token_crypto import decrypt_token_blob
+            try:
+                token_data = decrypt_token_blob(token_data)
+            except Exception:
+                # If it's already a string token (legacy), try as-is
+                pass
+        if isinstance(token_data, dict):
+            raw = token_data.get("token") or token_data.get("refresh_token")
+        elif isinstance(token_data, str):
+            raw = token_data
+        if not raw:
+            return False
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Google revocation endpoint accepts either access or refresh token
+            r = await client.post(
+                "https://oauth2.googleapis.com/revoke",
+                data={"token": raw},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            # 200 = revoked, 400 = already invalid/expired — both mean "not usable anymore"
+            if r.status_code in (200, 400):
+                logger.info("Google token revoke succeeded (status=%d)", r.status_code)
+                return True
+            logger.warning("Google token revoke unexpected status=%d", r.status_code)
+            return False
+    except Exception as e:
+        logger.warning("Google token revoke failed: %s", type(e).__name__)
+        return False
