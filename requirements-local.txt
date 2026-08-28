@@ -47,3 +47,8 @@ tenacity==8.3.0
 # It requires grpcio-tools which has no Python 3.14 binary wheel.
 # The bot runs fine without it — semantic memory search is just disabled.
 # On Render (Python 3.11), use the full requirements.txt
+
+# Optional — Phase 2/3 shared cache & observability (fallback to in-memory if not installed)
+# Uncomment to test multi-replica locally:
+# redis==5.0.5
+# sentry-sdk==2.22.0
