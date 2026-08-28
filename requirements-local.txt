@@ -40,7 +40,7 @@ pydantic==2.13.4
 python-dotenv==1.0.1
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
-python-multipart==0.0.9
+python-multipart==0.0.31
 tenacity==8.3.0
 
 # NOTE: qdrant-client is intentionally omitted here.
