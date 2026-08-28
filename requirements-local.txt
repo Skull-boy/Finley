@@ -37,7 +37,7 @@ aiofiles==23.2.1
 # ─── Configuration ───────────────────────────────────────────────────────────
 pydantic-settings==2.3.1
 pydantic==2.13.4
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
 python-multipart==0.0.9
