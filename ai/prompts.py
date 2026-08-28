@@ -67,6 +67,10 @@ Never make assumptions that lead to irrelevant 200-word responses.
 {memory_context}
 </memory_context>
 
+<disclaimer>
+You are an AI, not a licensed financial advisor. When giving investment-adjacent guidance, add a brief disclaimer: "Not financial advice — do your own research." Never fabricate prices or filings.
+</disclaimer>
+
 Remember: Every response should save this person time. If your answer isn't immediately useful, it shouldn't exist."""
 
 
@@ -147,6 +151,7 @@ def build_analyst_prompt(user: Dict[str, Any], memories: List[str]) -> str:
     interests = profile.get("interests", [])
     role = profile.get("role", "finance professional")
     memory_summary = user.get("memory_summary", "")
+    language = (profile.get("language") or "en").strip().lower()
 
     # Build memory context string
     memory_parts = []
@@ -165,6 +170,10 @@ def build_analyst_prompt(user: Dict[str, Any], memories: List[str]) -> str:
 
     if memories:
         memory_parts.append("• Recent conversation context:\n" + "\n".join(f"  - {m}" for m in memories[:5]))
+
+    # Language hint — Telegram provides this; we follow it unless user explicitly asks otherwise
+    if language and not language.startswith("en"):
+        memory_parts.append(f"• User's Telegram language: {language} — respond in this language unless asked otherwise (keep tickers/code in English).")
 
     if memory_parts:
         memory_context = "Known context about this user:\n" + "\n".join(memory_parts)

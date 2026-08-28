@@ -52,6 +52,9 @@ class GeminiGateway:
         self.current_index = 0
         self.cooldowns: Dict[int, float] = {}  # key_index → cooldown_until timestamp
         self._lock = asyncio.Lock()
+        # BYOK isolated per-user clients (Phase 1) — never shared, never falls back to pool
+        self._byok_clients: Dict[int, tuple] = {}  # user_id → (client, key)
+        self._byok_cooldowns: Dict[int, float] = {}  # user_id → cooldown_until
 
         if len(self.api_keys) < 2:
             logger.warning(
@@ -81,6 +84,33 @@ class GeminiGateway:
         """Put a key on cooldown after hitting rate limit."""
         self.cooldowns[key_index] = time.time() + seconds
         self.current_index = (key_index + 1) % len(self.clients)
+
+    # ─── BYOK (Phase 1: isolated per-user key, never touches pool) ──────────
+
+    async def _get_byok_client(self, user_id: Optional[int]):
+        """Return BYOK client for this user, or None. Honors per-user cooldown."""
+        if user_id is None:
+            return None
+        # Check cooldown
+        if self._byok_cooldowns.get(user_id, 0) > time.time():
+            return None
+        try:
+            from db.crud import get_byok_key
+            key = await get_byok_key(user_id)
+        except Exception:
+            return None
+        if not key:
+            return None
+        cached = self._byok_clients.get(user_id)
+        if cached and cached[1] == key:
+            return cached[0]
+        # New or rotated key → create client
+        client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=30_000))
+        self._byok_clients[user_id] = (client, key)
+        return client
+
+    def _put_byok_on_cooldown(self, user_id: int, seconds: int = 65):
+        self._byok_cooldowns[user_id] = time.time() + seconds
 
     @staticmethod
     def _is_transient(e: Exception) -> bool:
@@ -123,6 +153,41 @@ class GeminiGateway:
                 gemini_history.append(
                     types.Content(role=role, parts=[types.Part(text=msg["content"])])
                 )
+
+        # ── BYOK fast-path (isolated, never borrows pool quota) ─────────
+        if user_id is not None:
+            byok_client = await self._get_byok_client(user_id)
+            if byok_client is not None:
+                # Single-key retry — don't fall back to pool (quota isolation)
+                for _ in range(3):
+                    try:
+                        if tools is not None:
+                            return await self._agentic_loop(
+                                byok_client, model, config, gemini_history, prompt, user_id
+                            )
+                        chat = byok_client.aio.chats.create(
+                            model=model, history=gemini_history, config=config
+                        )
+                        response = await chat.send_message(prompt)
+                        if response.text:
+                            return response.text
+                        last_finish = getattr(response, "finish_reason", None)
+                        logger.warning(f"BYOK empty response (finish_reason={last_finish}) — retrying")
+                        await asyncio.sleep(3)
+                    except Exception as e:
+                        if not self._is_transient(e):
+                            # Invalid key etc. — tell user, don't rotate to pool
+                            logger.error(f"BYOK Gemini error (user {user_id}): {type(e).__name__}: {e}")
+                            raise RuntimeError(
+                                "Your personal Gemini key failed — check it with /byok status or remove it via /byok clear to use the shared quota."
+                            ) from e
+                        if getattr(e, "code", None) == 429:
+                            self._put_byok_on_cooldown(user_id)
+                            logger.warning(f"BYOK rate limited for user {user_id} — cooldown 65s")
+                            raise RuntimeError("Your personal Gemini key is rate-limited. Try again shortly or /byok clear to use shared quota.")
+                        logger.warning(f"BYOK transient for user {user_id}: {type(e).__name__}")
+                        await asyncio.sleep(6)
+                raise RuntimeError("Your personal Gemini key is temporarily unavailable.")
 
         last_finish = None
         for _ in range(self.MAX_ATTEMPTS):
@@ -264,8 +329,27 @@ class GeminiGateway:
 
     # ─── Embedding generation ─────────────────────────────────────────────────
 
-    async def embed(self, text: str) -> List[float]:
+    async def embed(self, text: str, user_id: Optional[int] = None) -> List[float]:
         """Generate a text embedding using Gemini's embedding model (768-dim)."""
+        # BYOK path for embeddings (isolated)
+        if user_id is not None:
+            byok_client = await self._get_byok_client(user_id)
+            if byok_client is not None:
+                try:
+                    result = await asyncio.to_thread(
+                        byok_client.models.embed_content,
+                        model=self.EMBED_MODEL,
+                        contents=text,
+                        config=types.EmbedContentConfig(output_dimensionality=768),
+                    )
+                    return result.embeddings[0].values if result.embeddings else []
+                except Exception as e:
+                    if not self._is_transient(e):
+                        return []
+                    if getattr(e, "code", None) == 429:
+                        self._put_byok_on_cooldown(user_id)
+                    return []
+
         for _ in range(self.MAX_ATTEMPTS):
             client, key_idx = await self._pick_client()
 
