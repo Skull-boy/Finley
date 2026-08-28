@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 
 from config import settings
+from services.financial.cache import get_cached, set_cached
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -18,8 +19,13 @@ async def get_company_news(ticker: str, days: int = 7) -> str:
     """
     Get recent news for a specific company.
     Returns a formatted list of top 5 most relevant headlines with context.
+    Cached 5 min.
     """
     ticker = ticker.upper().strip()
+    cache_key = f"news:company:{ticker}:{days}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
     to_date = datetime.utcnow().strftime("%Y-%m-%d")
     from_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -55,7 +61,10 @@ async def get_company_news(ticker: str, days: int = 7) -> str:
                 else:
                     lines.append(f"• {headline} <i>— {source}, {ts}</i>")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        if "Could not fetch" not in result:
+            set_cached(cache_key, result, ttl=300)
+        return result
 
     except Exception as e:
         return f"Could not fetch news for {ticker}: {str(e)}"
@@ -65,10 +74,15 @@ async def get_market_news(category: str = "general") -> str:
     """
     Get general market news by category.
     Categories: general, forex, crypto, merger, technology, economy
+    Cached 5 min.
     """
     valid_categories = ["general", "forex", "crypto", "merger", "technology"]
     if category not in valid_categories:
         category = "general"
+    cache_key = f"news:market:{category}"
+    hit = get_cached(cache_key)
+    if hit is not None:
+        return hit
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -97,7 +111,10 @@ async def get_market_news(category: str = "general") -> str:
                 else:
                     lines.append(f"• {headline} <i>— {source}, {ts}</i>")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        if "Could not fetch" not in result:
+            set_cached(cache_key, result, ttl=300)
+        return result
 
     except Exception as e:
         return f"Could not fetch market news: {str(e)}"

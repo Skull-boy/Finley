@@ -60,6 +60,14 @@ async def analyze_document(file_path: str, user_question: str = "") -> str:
     if mime_type == "application/octet-stream":
         return "I can analyze PDFs, images (PNG/JPG), and CSV files. Please upload one of these formats."
 
+    # Sanitize user_question to blunt prompt-injection via caption (LLM01)
+    if user_question:
+        try:
+            from security.sanitize import sanitize_input
+            user_question = sanitize_input(user_question, max_len=500)[:500]
+        except Exception:
+            pass
+
     gateway = get_gateway()
     uploaded = None
 
@@ -92,6 +100,13 @@ async def analyze_image(file_path: str, user_question: str = "") -> str:
     """
     ext = os.path.splitext(file_path)[1].lower()
     mime_type = SUPPORTED_MIME_TYPES.get(ext, "image/jpeg")
+
+    if user_question:
+        try:
+            from security.sanitize import sanitize_input
+            user_question = sanitize_input(user_question, max_len=500)[:500]
+        except Exception:
+            pass
 
     gateway = get_gateway()
     uploaded = None
