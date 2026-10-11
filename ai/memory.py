@@ -11,8 +11,11 @@ and "you mentioned you prefer concise responses."
 """
 import asyncio
 import functools
+import hashlib
 import json
 import logging
+import math
+import re
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -57,6 +60,131 @@ def _extract_extra(self, user_id: int, conversation=None, *args, **kwargs) -> st
     return f"user={user_id} turns={n}"
 
 
+# ─── Step 6A/6B helpers: structured metadata + BM25-style sparse vectors ───
+
+SPARSE_FIELD = "bm25"
+SPARSE_DIM = 1 << 15  # 32768 hash buckets — zero-dep, stable across restarts
+
+# Ultra-common tokens contribute almost no discrimination; dampen instead of drop.
+_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
+    "and", "or", "in", "on", "at", "for", "with", "about", "me", "my", "you",
+    "your", "i", "am", "it", "its", "as", "by", "do", "does", "did", "what",
+    "when", "get", "user", "if", "we", "they", "them", "this", "that",
+})
+
+_TOKEN_RE = re.compile(r"[a-z0-9$]{2,}")
+_TICKER_RE = re.compile(r"\$?([A-Z]{2,5})\b")
+# Uppercase tokens that are never tickers (timezones, acronyms).
+_NON_TICKER = frozenset({
+    "IST", "EST", "PST", "CST", "MST", "UTC", "GMT", "CET", "EDT", "PDT",
+    "US", "USA", "UK", "EU", "AI", "OK", "CEO", "CFO", "CTO", "FAQ", "GDP",
+    "FED", "SEC", "IRS", "URL", "API", "TV", "PC", "AM", "PM",
+})
+_DATE_RE = re.compile(
+    r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b"
+    r"|\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
+    r"sat(?:urday)?|sun(?:day)?|today|tomorrow|morning|evening|daily)\b",
+    re.IGNORECASE,
+)
+
+# Ordered first-match rules: alert beats preference ("wants price alert").
+_METRIC_RULES = (
+    ("alert", ("alert", "below", "above", "notify", "trigger", "threshold")),
+    ("briefing", ("briefing", "morning brief", "daily update", "daily brief")),
+    ("earnings", ("earning",)),
+    ("watchlist", ("watchlist", "watching", "tracking", "follow", "portfolio", "own ", "holds")),
+    ("price", ("price", "quote", "bought", "sold", "buy", "sell", "share")),
+    ("preference", ("prefer", "like", "want", "concise", "detailed")),
+)
+
+
+def _stem(tok: str) -> str:
+    """Tiny deterministic stemmer (plurals/verb forms) for sparse recall.
+
+    Same function runs at write and query time, so any over-stemming is
+    self-consistent. Deliberately conservative: short tokens untouched.
+    """
+    if len(tok) > 6 and tok.endswith("ing"):
+        return tok[:-3]
+    if len(tok) > 5 and tok.endswith("ed"):
+        return tok[:-2]
+    if len(tok) > 4 and tok.endswith("es") and not tok.endswith(("ses", "xes", "shes", "ches")):
+        return tok[:-1]
+    if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+        return tok[:-1]
+    return tok
+
+
+def _tokens(text: str) -> List[str]:
+    return [_stem(t) for t in _TOKEN_RE.findall((text or "").lower())]
+
+
+def sparse_vector(text: str) -> Dict[str, List]:
+    """Deterministic BM25-style sparse embedding (hash TF, no-IDF by design).
+
+    Per-user corpora are tiny (<=100 facts), so corpus IDF is unstable;
+    instead: sublinear TF (1+log tf), stopword dampening, L2 normalization
+    (Qdrant sparse scores by inner product, so this == cosine). hashlib —
+    never hash() — keeps write/query mappings identical across restarts.
+    Returns {"indices": [...sorted...], "values": [...]}.
+    """
+    tf: Dict[str, int] = {}
+    for tok in _tokens(text):
+        tf[tok] = tf.get(tok, 0) + 1
+    weights: Dict[int, float] = {}
+    for tok, count in tf.items():
+        bucket = int.from_bytes(hashlib.sha256(tok.encode()).digest()[:4], "big") % SPARSE_DIM
+        w = 1.0 + math.log(count)
+        if tok in _STOPWORDS:
+            w *= 0.2
+        weights[bucket] = weights.get(bucket, 0.0) + w
+    norm = math.sqrt(sum(v * v for v in weights.values())) or 1.0
+    indices = sorted(weights)
+    return {"indices": indices, "values": [weights[i] / norm for i in indices]}
+
+
+def extract_metadata(fact: str, source: str = "user_query") -> Dict[str, Any]:
+    """Step 6A: structured, filterable payload fields for a memory fact.
+
+    Stored as top-level Qdrant payload keys (not inside the text blob).
+    Ticker candidates are validated with the same rules as trading paths.
+    """
+    text = fact or ""
+    lowered = text.lower()
+    tickers: List[str] = []
+    try:
+        from security.validation import clean_ticker
+        seen = set()
+        for m in _TICKER_RE.finditer(text):
+            cand = m.group(1)
+            if cand in _NON_TICKER:
+                continue
+            t = clean_ticker(cand)
+            if t and t not in seen:
+                seen.add(t)
+                tickers.append(t)
+    except Exception:
+        tickers = []
+    metric_type = "general"
+    for label, keywords in _METRIC_RULES:
+        if any(k in lowered for k in keywords):
+            metric_type = label
+            break
+    matches = [m.group(0) for m in _DATE_RE.finditer(text)]
+    # Prefer clock times ("8am") over dayparts ("morning") when both appear.
+    date_hint = next(
+        (m for m in matches if any(ch.isdigit() for ch in m)),
+        matches[0] if matches else "",
+    )
+    return {
+        "ticker": tickers,
+        "metric_type": metric_type,
+        "date": date_hint,
+        "source": source or "user_query",
+    }
+
+
 class MemoryManager:
     """
     Manages long-term semantic memory for users.
@@ -98,6 +226,8 @@ Return ONLY the updated summary text."""
         self._qdrant_client = None
         self._collection_name = "finbot_memories"
         self._qdrant_ready = False
+        self._hybrid_ready = False  # sparse BM25 field present (Step 6B)
+        self._schema_checked = False
         self._extraction_counts: Dict[int, int] = {}
         self._setup_qdrant()
 
@@ -116,29 +246,112 @@ Return ONLY the updated summary text."""
                 self._qdrant_ready = False
 
     async def _ensure_collection(self, vector_size: int = 768):
-        """Create Qdrant collection if it doesn't exist."""
+        """Create the Qdrant collection if missing; additively migrate it for
+        hybrid search (Step 6B) without touching existing dense vectors.
+
+        The default (unnamed) dense vector is never altered, so legacy points
+        stay valid. The BM25 sparse field is added alongside via
+        update_collection — purely additive. Anything unsupported by the
+        server degrades to dense-only (_hybrid_ready stays False).
+        """
         if not self._qdrant_ready:
             return
         try:
-            from qdrant_client.models import Distance, VectorParams
-            collections = await asyncio.to_thread(self._qdrant_client.get_collections)
-            existing = [c.name for c in collections.collections]
-            if self._collection_name not in existing:
-                await asyncio.to_thread(
-                    self._qdrant_client.create_collection,
-                    collection_name=self._collection_name,
-                    vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+            from qdrant_client.models import (
+                Distance, VectorParams, SparseVectorParams,
+            )
+            try:
+                info = await asyncio.to_thread(
+                    self._qdrant_client.get_collection, self._collection_name
                 )
+            except Exception:
+                info = None
+            if info is None:
+                try:
+                    await asyncio.to_thread(
+                        self._qdrant_client.create_collection,
+                        collection_name=self._collection_name,
+                        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                        sparse_vectors_config={SPARSE_FIELD: SparseVectorParams()},
+                    )
+                    self._hybrid_ready = True
+                except Exception:
+                    # Older server without sparse support — dense-only collection
+                    await asyncio.to_thread(
+                        self._qdrant_client.create_collection,
+                        collection_name=self._collection_name,
+                        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                    )
+                    self._hybrid_ready = False
+            else:
+                params = getattr(getattr(info, "config", None), "params", None)
+                sparse_cfg = getattr(params, "sparse_vectors", None) or {}
+                if SPARSE_FIELD in sparse_cfg:
+                    self._hybrid_ready = True
+                else:
+                    # Additive migration: create_vector_name adds the sparse
+                    # field without touching existing dense vectors/points
+                    # (REST PUT /collections/{name}/vectors, server >= 1.10).
+                    # Older servers fall back to update_collection; if neither
+                    # works we stay dense-only rather than risk data.
+                    try:
+                        from qdrant_client.models import (
+                            SparseVectorNameConfig, SparseVectorConfig,
+                        )
+                        await asyncio.to_thread(
+                            self._qdrant_client.create_vector_name,
+                            self._collection_name,
+                            SPARSE_FIELD,
+                            SparseVectorNameConfig(sparse=SparseVectorConfig()),
+                        )
+                        self._hybrid_ready = True
+                    except Exception:
+                        try:
+                            await asyncio.to_thread(
+                                self._qdrant_client.update_collection,
+                                collection_name=self._collection_name,
+                                sparse_vectors_config={SPARSE_FIELD: SparseVectorParams()},
+                            )
+                            self._hybrid_ready = True
+                        except Exception:
+                            self._hybrid_ready = False
+            self._schema_checked = True
+            if self._hybrid_ready:
+                await self._ensure_payload_indexes()
         except Exception:
             self._qdrant_ready = False
+
+    async def _ensure_payload_indexes(self) -> None:
+        """Best-effort keyword indexes for the Step 6A metadata fields."""
+        try:
+            from qdrant_client.models import PayloadSchemaType
+            for field in ("ticker", "metric_type", "source"):
+                try:
+                    await asyncio.to_thread(
+                        self._qdrant_client.create_payload_index,
+                        collection_name=self._collection_name,
+                        field_name=field,
+                        field_schema=PayloadSchemaType.KEYWORD,
+                    )
+                except Exception:
+                    pass  # index exists or unsupported — filtering still works
+        except Exception:
+            pass
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
     @_timed("memory_write", _extract_extra)
-    async def extract_and_store(self, user_id: int, conversation: List[Dict[str, str]]) -> None:
+    async def extract_and_store(
+        self,
+        user_id: int,
+        conversation: List[Dict[str, str]],
+        source: str = "user_query",
+    ) -> None:
         """
         Extract memorable facts from a conversation and store them.
         Called asynchronously after each conversation turn — doesn't block responses.
+
+        source labels the Qdrant payload (user_query | tool_result | briefing).
         """
         if len(conversation) < 2:
             return
@@ -188,27 +401,45 @@ Return ONLY the updated summary text."""
                         await save_memory(user_id, fact, embedding)
                         # Also store in Qdrant if available
                         if self._qdrant_ready:
-                            await self._store_in_qdrant(user_id, fact, embedding)
+                            await self._store_in_qdrant(user_id, fact, embedding, source=source)
                 except Exception:
                     pass
 
         # Update memory summary (non-blocking, best-effort)
         await self._update_summary(user_id, facts)
 
-    async def _store_in_qdrant(self, user_id: int, fact: str, embedding: List[float]):
-        """Store a memory vector in Qdrant."""
+    async def _store_in_qdrant(
+        self, user_id: int, fact: str, embedding: List[float], source: str = "user_query"
+    ):
+        """Store a memory vector in Qdrant with structured metadata (Step 6A).
+
+        Payload carries filterable fields alongside the text — never inside it.
+        The dense vector stays the default (unnamed) vector; the sparse BM25
+        vector rides alongside only when the collection supports it, so legacy
+        servers keep receiving the exact legacy shape.
+        """
         try:
-            from qdrant_client.models import PointStruct
+            from qdrant_client.models import PointStruct, SparseVector
             import uuid
             await self._ensure_collection(len(embedding))
+            payload = {
+                "user_id": user_id,
+                "fact": fact,
+                "created_at": datetime.utcnow().isoformat(),
+                **extract_metadata(fact, source),
+            }
+            if self._hybrid_ready:
+                sv = sparse_vector(fact)
+                vector = {
+                    "": embedding,
+                    SPARSE_FIELD: SparseVector(indices=sv["indices"], values=sv["values"]),
+                }
+            else:
+                vector = embedding
             point = PointStruct(
                 id=str(uuid.uuid4()),
-                vector=embedding,
-                payload={
-                    "user_id": user_id,
-                    "fact": fact,
-                    "created_at": datetime.utcnow().isoformat()
-                }
+                vector=vector,
+                payload=payload,
             )
             await asyncio.to_thread(
                 self._qdrant_client.upsert,
@@ -230,35 +461,92 @@ Return ONLY the updated summary text."""
             return await self._mongodb_fallback_search(user_id, limit)
 
     async def _qdrant_search(self, user_id: int, query: str, limit: int) -> List[str]:
-        """Semantic search using Qdrant vector similarity."""
+        """Hybrid retrieval (Step 6B): BM25 sparse + dense, fused with RRF.
+
+        Flow: prefetch top-20 sparse + top-20 dense (both user-filtered),
+        fuse with RRF, return top `limit`. Fused ranks carry no absolute
+        threshold (RRF scores are relative), so — unlike the dense path —
+        nothing is score-cut here. Any hybrid failure degrades to the
+        pre-existing dense search, then to the Mongo fallback.
+        """
         try:
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
             gateway = get_gateway()
             query_embedding = await gateway.embed(query)
 
             if not query_embedding:
                 return await self._mongodb_fallback_search(user_id, limit)
 
-            # Use proper Qdrant Filter model — not a raw dict
-            search_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="user_id",
-                        match=MatchValue(value=user_id)
-                    )
-                ]
-            )
-
-            results = await asyncio.to_thread(
-                self._qdrant_client.query_points,
-                collection_name=self._collection_name,
-                query=query_embedding,
-                query_filter=search_filter,
-                limit=limit
-            )
-            return [r.payload["fact"] for r in results.points if r.score > 0.5]
+            if self._hybrid_ready or not self._schema_checked:
+                try:
+                    return await self._hybrid_search(user_id, query, query_embedding, limit)
+                except Exception:
+                    pass  # fall through to dense-only
+            return await self._dense_search(user_id, query_embedding, limit)
         except Exception:
             return await self._mongodb_fallback_search(user_id, limit)
+
+    async def _hybrid_search(
+        self, user_id: int, query: str, query_embedding: List[float], limit: int
+    ) -> List[str]:
+        from qdrant_client.models import (
+            Filter, FieldCondition, MatchValue, Prefetch,
+            FusionQuery, Fusion, SparseVector,
+        )
+        if not self._schema_checked:
+            await self._ensure_collection(len(query_embedding))
+        if not self._hybrid_ready:
+            return await self._dense_search(user_id, query_embedding, limit)
+
+        search_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="user_id",
+                    match=MatchValue(value=user_id)
+                )
+            ]
+        )
+        sv = sparse_vector(query)
+        results = await asyncio.to_thread(
+            self._qdrant_client.query_points,
+            collection_name=self._collection_name,
+            prefetch=[
+                Prefetch(query=query_embedding, limit=20, filter=search_filter),
+                Prefetch(
+                    query=SparseVector(indices=sv["indices"], values=sv["values"]),
+                    using=SPARSE_FIELD,
+                    limit=20,
+                    filter=search_filter,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=limit,
+        )
+        return [r.payload["fact"] for r in results.points if "fact" in (r.payload or {})]
+
+    async def _dense_search(
+        self, user_id: int, query_embedding: List[float], limit: int
+    ) -> List[str]:
+        """Pre-existing dense-only search (unchanged behavior + threshold)."""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        # Use proper Qdrant Filter model — not a raw dict
+        search_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="user_id",
+                    match=MatchValue(value=user_id)
+                )
+            ]
+        )
+
+        results = await asyncio.to_thread(
+            self._qdrant_client.query_points,
+            collection_name=self._collection_name,
+            query=query_embedding,
+            query_filter=search_filter,
+            limit=limit
+        )
+        return [r.payload["fact"] for r in results.points if r.score > 0.5]
 
     async def _mongodb_fallback_search(self, user_id: int, limit: int) -> List[str]:
         """Fallback: return the most recent memories from MongoDB."""
