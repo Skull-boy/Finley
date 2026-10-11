@@ -228,6 +228,22 @@ def _make_tools() -> types.Tool:
 # ─── Tool Executor ────────────────────────────────────────────────────────────
 
 
+def _cap(text: str, max_chars: int) -> str:
+    """Step 5A: bound LLM-bound tool payloads without breaking meaning.
+
+    Cuts at a line boundary so surviving items stay well-formed (headlines,
+    links, metrics intact); the tail — oldest news, later calendar dates —
+    is what goes. Service outputs themselves are untouched (/watchlist and
+    caches display the raw strings).
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    cut = text.rfind("\n", 0, max_chars)
+    if cut < max_chars // 2:
+        cut = max_chars
+    return text[:cut].rstrip() + "\n…[truncated]"
+
+
 @_timed("tool_call", lambda tool_name, *a, **k: f"tool={tool_name}")
 async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[int] = None) -> str:
     """
@@ -252,7 +268,7 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
 
         elif tool_name == "get_company_news":
             from services.financial.news import get_company_news
-            return await get_company_news(_ticker(), args.get("days", 7))
+            return _cap(await get_company_news(_ticker(), args.get("days", 7)), 1500)
 
         elif tool_name == "get_market_summary":
             from services.financial.market import get_market_summary
@@ -260,22 +276,22 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
 
         elif tool_name == "get_company_financials":
             from services.financial.fundamentals import get_company_financials
-            return await get_company_financials(_ticker())
+            return _cap(await get_company_financials(_ticker()), 1500)
 
         elif tool_name == "get_earnings_calendar":
             from services.financial.earnings import get_earnings_calendar
-            return await get_earnings_calendar(
+            return _cap(await get_earnings_calendar(
                 days_ahead=args.get("days_ahead", 7),
                 ticker=_ticker() if args.get("ticker") else None
-            )
+            ), 1200)
 
         elif tool_name == "search_sec_filings":
             from services.financial.sec_edgar import search_sec_filings
-            return await search_sec_filings(_ticker(), args.get("filing_type", ""))
+            return _cap(await search_sec_filings(_ticker(), args.get("filing_type", "")), 1500)
 
         elif tool_name == "get_market_news":
             from services.financial.news import get_market_news
-            return await get_market_news(args.get("category", "general"))
+            return _cap(await get_market_news(args.get("category", "general")), 1200)
 
         elif tool_name == "add_to_watchlist":
             if user_id:
@@ -348,7 +364,7 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
                 if not watchlist:
                     return "Your watchlist is empty. Add tickers by saying 'add AAPL to my watchlist'."
                 quotes = await asyncio.gather(*[get_stock_quote(t) for t in watchlist[:10]])
-                return "\n\n".join(q for q in quotes if q)
+                return _cap("\n\n".join(q for q in quotes if q), 2000)
             return "Could not get watchlist — user context missing."
 
         elif tool_name == "compare_companies":
@@ -356,7 +372,7 @@ async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[i
             tickers = [t for t in (clean_ticker(t) for t in args.get("tickers", [])) if t]
             if not tickers:
                 raise _InvalidTicker()
-            return await compare_companies(tickers)
+            return _cap(await compare_companies(tickers), 1500)
 
         elif tool_name == "get_analyst_ratings":
             from services.financial.fundamentals import get_analyst_ratings

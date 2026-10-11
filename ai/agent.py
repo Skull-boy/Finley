@@ -159,11 +159,13 @@ class FinancialAgent:
             _safe_search(),
             get_recent_history(user_id, limit=settings.bot_max_history),
         )
-        # Convert to Gemini format (exclude very long messages to save tokens)
-        gemini_history = [
-            {"role": msg["role"], "content": _truncate(msg["content"], 500)}
-            for msg in history
-        ]
+        # Rolling compression (Step 5B): beyond the threshold, older turns are
+        # covered by the stored memory_summary — already injected into the
+        # system prompt by build_analyst_prompt — so only the most recent
+        # turns ride verbatim. Never compress the most recent 3.
+        gemini_history = _build_gemini_history(
+            history, user.get("memory_summary", "")
+        )
 
         # ── 5. Build personalized system prompt ───────────────────────────────
         system_prompt = build_analyst_prompt(user, relevant_memories)
@@ -254,6 +256,29 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "..."
+
+
+# Step 5B tuning: compress only when history exceeds the threshold, keep the
+# most recent turns verbatim, and never strand a young conversation that has
+# no stored summary yet (keep 6 verbatim instead of 3 in that case).
+HISTORY_COMPRESS_THRESHOLD = 6
+HISTORY_KEEP_VERBATIM = 3
+HISTORY_KEEP_NO_SUMMARY = 6
+
+
+def _build_gemini_history(history: List[Dict[str, Any]], memory_summary: str) -> List[Dict[str, str]]:
+    """Build the LLM-bound history with rolling context compression."""
+    if len(history) <= HISTORY_COMPRESS_THRESHOLD:
+        selected = history
+    elif (memory_summary or "").strip():
+        selected = history[-HISTORY_KEEP_VERBATIM:]
+    else:
+        selected = history[-HISTORY_KEEP_NO_SUMMARY:]
+    # Exclude very long messages to save tokens
+    return [
+        {"role": msg["role"], "content": _truncate(msg["content"], 500)}
+        for msg in selected
+    ]
 
 
 def _format_for_telegram(text: str) -> str:

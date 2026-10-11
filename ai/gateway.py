@@ -58,6 +58,26 @@ def _gemini_extra(self, *args, **kwargs) -> str:
     return f"model={model} keys={len(getattr(self, 'clients', []))}"
 
 
+def _log_usage(response: Any, where: str) -> None:
+    """Step 5 token meter — reads Gemini usage metadata, never alters flow.
+
+    Emits a parseable TOKENS line per successful model response. Absent
+    metadata (mocks, older SDK payloads) simply logs nothing.
+    """
+    try:
+        um = getattr(response, "usage_metadata", None)
+        if um is None:
+            return
+        logger.info(
+            "TOKENS | input=%s | output=%s | extra=%s",
+            getattr(um, "prompt_token_count", 0) or 0,
+            getattr(um, "candidates_token_count", 0) or 0,
+            where,
+        )
+    except Exception:
+        pass
+
+
 class GeminiGateway:
     """
     Thread-safe multi-key Gemini gateway with automatic rotation.
@@ -208,6 +228,7 @@ class GeminiGateway:
                             model=model, history=gemini_history, config=config
                         )
                         response = await chat.send_message(prompt)
+                        _log_usage(response, "path=byok_direct")
                         if response.text:
                             return response.text
                         last_finish = getattr(response, "finish_reason", None)
@@ -252,6 +273,7 @@ class GeminiGateway:
                         config=config,
                     )
                     response = await chat.send_message(prompt)
+                    _log_usage(response, "path=pool_direct")
                     if response.text:
                         return response.text
                     last_finish = getattr(response, "finish_reason", None)
@@ -282,7 +304,9 @@ class GeminiGateway:
         """Send a chat message, retrying transient 429/5xx errors in place."""
         for attempt in range(attempts):
             try:
-                return await chat.send_message(content)
+                response = await chat.send_message(content)
+                _log_usage(response, "path=agentic")
+                return response
             except Exception as e:
                 if not self._is_transient(e):
                     raise
@@ -484,6 +508,7 @@ class GeminiGateway:
                         max_output_tokens=2048,
                     ),
                 )
+                _log_usage(response, "path=file")
                 return response.text or ""
             except Exception as e:
                 if not self._is_transient(e):
