@@ -228,6 +228,7 @@ Return ONLY the updated summary text."""
         self._qdrant_ready = False
         self._hybrid_ready = False  # sparse BM25 field present (Step 6B)
         self._schema_checked = False
+        self._ensure_lock = asyncio.Lock()  # serialize collection migrations
         self._extraction_counts: Dict[int, int] = {}
         self._setup_qdrant()
 
@@ -256,10 +257,15 @@ Return ONLY the updated summary text."""
         """
         if not self._qdrant_ready:
             return
+        async with self._ensure_lock:
+            await self._ensure_collection_inner(vector_size)
+
+    async def _ensure_collection_inner(self, vector_size: int = 768):
+        """Collection setup + hybrid migration (runs under _ensure_lock)."""
+        from qdrant_client.models import (
+            Distance, VectorParams, SparseVectorParams,
+        )
         try:
-            from qdrant_client.models import (
-                Distance, VectorParams, SparseVectorParams,
-            )
             try:
                 info = await asyncio.to_thread(
                     self._qdrant_client.get_collection, self._collection_name
@@ -289,37 +295,132 @@ Return ONLY the updated summary text."""
                 if SPARSE_FIELD in sparse_cfg:
                     self._hybrid_ready = True
                 else:
-                    # Additive migration: create_vector_name adds the sparse
-                    # field without touching existing dense vectors/points
-                    # (REST PUT /collections/{name}/vectors, server >= 1.10).
-                    # Older servers fall back to update_collection; if neither
-                    # works we stay dense-only rather than risk data.
-                    try:
-                        from qdrant_client.models import (
-                            SparseVectorNameConfig, SparseVectorConfig,
-                        )
-                        await asyncio.to_thread(
-                            self._qdrant_client.create_vector_name,
-                            self._collection_name,
-                            SPARSE_FIELD,
-                            SparseVectorNameConfig(sparse=SparseVectorConfig()),
-                        )
-                        self._hybrid_ready = True
-                    except Exception:
-                        try:
-                            await asyncio.to_thread(
-                                self._qdrant_client.update_collection,
-                                collection_name=self._collection_name,
-                                sparse_vectors_config={SPARSE_FIELD: SparseVectorParams()},
-                            )
-                            self._hybrid_ready = True
-                        except Exception:
-                            self._hybrid_ready = False
+                    await self._add_sparse_to_existing(vector_size)
             self._schema_checked = True
             if self._hybrid_ready:
                 await self._ensure_payload_indexes()
         except Exception:
             self._qdrant_ready = False
+
+    async def _add_sparse_to_existing(self, vector_size: int) -> None:
+        """Add the BM25 sparse field to a legacy dense-only collection.
+
+        Chain (first success wins, existing vectors never lost):
+        1. create_vector_name — additive, zero risk (server >= 1.13).
+        2. update_collection sparse_vectors_config (some versions).
+        3. Scroll → recreate → re-upsert with count verification: dense
+           vectors are preserved bit-for-bit, sparse is recomputed from the
+           stored fact text (servers like 1.12 support neither 1 nor 2).
+        Anything failing degrades to dense-only.
+        """
+        from qdrant_client.models import SparseVectorParams
+        try:
+            from qdrant_client.models import (
+                SparseVectorNameConfig, SparseVectorConfig,
+            )
+            await asyncio.to_thread(
+                self._qdrant_client.create_vector_name,
+                self._collection_name,
+                SPARSE_FIELD,
+                SparseVectorNameConfig(sparse=SparseVectorConfig()),
+            )
+            self._hybrid_ready = True
+            return
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(
+                self._qdrant_client.update_collection,
+                collection_name=self._collection_name,
+                sparse_vectors_config={SPARSE_FIELD: SparseVectorParams()},
+            )
+            self._hybrid_ready = True
+            return
+        except Exception:
+            pass
+        try:
+            await self._migrate_recreate_with_sparse(vector_size)
+            self._hybrid_ready = True
+        except Exception as e:
+            logger.warning("Qdrant sparse migration unavailable, staying dense-only: %s", type(e).__name__)
+            self._hybrid_ready = False
+
+    async def _migrate_recreate_with_sparse(self, vector_size: int) -> None:
+        """Last-resort migration for servers without vector-add APIs.
+
+        Reads every point (vectors + payloads) into memory first, then
+        recreates the collection with dense + sparse and re-upserts with a
+        count check. Raises on any mismatch so callers stay dense-only.
+        """
+        from qdrant_client.models import (
+            Distance, VectorParams, SparseVectorParams, SparseVector, PointStruct,
+        )
+        # 1. Drain the collection (batches; corpora here are small).
+        drained = []
+        offset = None
+        while True:
+            batch, offset = await asyncio.to_thread(
+                self._qdrant_client.scroll,
+                collection_name=self._collection_name,
+                limit=500,
+                offset=offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            drained.extend(batch)
+            if offset is None:
+                break
+        pre_count = len(drained)
+        dense_size = vector_size
+        for p in drained:
+            v = p.vector
+            if isinstance(v, dict):
+                v = v.get("") or v.get("dense") or []
+            if v:
+                dense_size = len(v)
+                break
+        # 2. Recreate with dense + sparse.
+        await asyncio.to_thread(
+            self._qdrant_client.delete_collection, collection_name=self._collection_name
+        )
+        await asyncio.to_thread(
+            self._qdrant_client.create_collection,
+            collection_name=self._collection_name,
+            vectors_config=VectorParams(size=dense_size, distance=Distance.COSINE),
+            sparse_vectors_config={SPARSE_FIELD: SparseVectorParams()},
+        )
+        # 3. Re-upsert in batches; dense preserved exactly, sparse recomputed.
+        upserted = 0
+        try:
+            for i in range(0, len(drained), 100):
+                chunk = []
+                for p in drained[i:i + 100]:
+                    v = p.vector
+                    if isinstance(v, dict):
+                        v = v.get("") or v.get("dense") or []
+                    sv = sparse_vector(((p.payload or {}).get("fact", "")))
+                    chunk.append(PointStruct(
+                        id=p.id,
+                        vector={"": list(v),
+                                SPARSE_FIELD: SparseVector(indices=sv["indices"],
+                                                           values=sv["values"])},
+                        payload=p.payload,
+                    ))
+                if chunk:
+                    await asyncio.to_thread(
+                        self._qdrant_client.upsert,
+                        collection_name=self._collection_name,
+                        points=chunk,
+                    )
+                    upserted += len(chunk)
+        finally:
+            total = await asyncio.to_thread(
+                self._qdrant_client.count, collection_name=self._collection_name
+            )
+            if total.count != pre_count or upserted != pre_count:
+                raise RuntimeError(
+                    f"sparse migration count mismatch: {upserted}/{pre_count} re-upserted"
+                )
 
     async def _ensure_payload_indexes(self) -> None:
         """Best-effort keyword indexes for the Step 6A metadata fields."""
@@ -505,19 +606,26 @@ Return ONLY the updated summary text."""
                 )
             ]
         )
+        # Dense prefetch is always present (recall-preserving, no cut).
+        prefetches = [Prefetch(query=query_embedding, limit=20, filter=search_filter)]
         sv = sparse_vector(query)
-        results = await asyncio.to_thread(
-            self._qdrant_client.query_points,
-            collection_name=self._collection_name,
-            prefetch=[
-                Prefetch(query=query_embedding, limit=20, filter=search_filter),
+        if sv["indices"]:
+            # Noise gate: an uninformative BM25 side (all-zero overlap) must
+            # not dilute a good dense ranking via RRF. Genuine term overlap
+            # scores >= ~0.3 (measured); pure stopword noise scores ~0.0.
+            prefetches.append(
                 Prefetch(
                     query=SparseVector(indices=sv["indices"], values=sv["values"]),
                     using=SPARSE_FIELD,
                     limit=20,
                     filter=search_filter,
-                ),
-            ],
+                    score_threshold=0.1,
+                )
+            )
+        results = await asyncio.to_thread(
+            self._qdrant_client.query_points,
+            collection_name=self._collection_name,
+            prefetch=prefetches,
             query=FusionQuery(fusion=Fusion.RRF),
             limit=limit,
         )

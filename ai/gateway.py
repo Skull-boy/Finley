@@ -89,7 +89,10 @@ class GeminiGateway:
 
     FAST_MODEL = "gemini-3.1-flash-lite"  # High quota, fast — use for most requests
     SMART_MODEL = "gemini-3.5-flash"        # More capable — use for complex analysis
-    EMBED_MODEL = "text-embedding-004"      # 768-dim embeddings (matches Qdrant collection)
+    # NOTE: text-embedding-004 was specified in the upgrade brief but 404s on the
+    # live API (verified 2026-10-11: only gemini-embedding-001/2 exist).
+    # gemini-embedding-001 @ 768 dims matches the Qdrant collection schema.
+    EMBED_MODEL = "gemini-embedding-001"    # 768-dim embeddings (matches Qdrant collection)
 
     MAX_ATTEMPTS = 6  # Retry cap across all keys — never recurse forever
 
