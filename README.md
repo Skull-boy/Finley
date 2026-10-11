@@ -76,10 +76,14 @@ Finley/
 │
 ├── ai/
 │   ├── gateway.py            # Multi-key pool + BYOK isolated + rotation + Files API
+│   │                         # Models: gemini-3.1-flash-lite (fast), gemini-3.5-flash (smart),
+│   │                         # gemini-embedding-001 @768d (google-genai SDK)
 │   ├── agent.py              # Orchestrator + injection guard (LLM01/02)
+│   │                         # Parallel context reads, rolling history compression, async persist
 │   ├── prompts.py            # Prompts + i18n hint
-│   ├── memory.py             # Qdrant + Mongo fallback + GDPR purge
-│   └── tools.py              # Tools + tiered alert caps (5/50)
+│   ├── memory.py             # Hybrid retrieval: BM25 sparse + dense RRF, structured payloads
+│   │                         # (ticker/metric_type/date/source) + Mongo fallback + GDPR purge
+│   └── tools.py              # Tools + tiered alert caps (5/50) + LLM payload caps
 │
 ├── bot/
 │   ├── handlers.py           # Handlers: text/voice/docs + /byok /briefing /alerts + GDPR
@@ -119,7 +123,16 @@ Finley/
 └── tests/                    # Offline test suite (no API keys needed)
     ├── test_gateway.py       # Retry/rotation behavior (mocked)
     ├── test_agent.py         # Tool-gating heuristics
-    └── test_formatters.py    # Telegram HTML formatting
+    ├── test_formatters.py    # Telegram HTML formatting
+    ├── test_phase0.py        # Sanitize, cache, GDPR commands, injection guardrails
+    ├── test_phase1.py        # Webhook auth, quick-start, onboarding, disconnect
+    ├── test_phase2.py        # BYOK, briefing, alert delete, admin stats
+    ├── test_rate_limit.py    # Sliding-window limiter
+    ├── test_security_limits.py # Message/file size caps, Google-connected flag
+    ├── test_state.py         # HMAC OAuth state tokens
+    ├── test_token_crypto.py  # Fernet encrypt/decrypt + rotation
+    ├── test_validation.py    # Ticker/threshold/direction validation
+    └── test_final_polish.py  # Alert pause IDOR, voice edit, Stripe stub, i18n
 ```
 
 ---
@@ -154,12 +167,55 @@ All tests are offline (mocked) — they run in CI on every push/PR via
 The gateway uses one key per Google account. When a key hits a rate limit
 (429) it's put on a 65-second cooldown and the next key is tried; transient
 5xx errors are retried with backoff. With 3 keys from 3 accounts you get
-3× the free quota.
+3× the free quota. Tool calls within one agentic round run concurrently via
+`asyncio.gather` with per-tool failure isolation — one failing tool degrades
+to an error string instead of crashing the round; rounds stay sequential
+because each depends on the previous round's results.
 
-### Semantic Memory
+### Models (google-genai SDK)
+| Path | Model | Notes |
+|------|-------|-------|
+| Fast (default) | `gemini-3.1-flash-lite` | Free tier, most requests |
+| Smart | `gemini-3.5-flash` | Better reasoning, complex analysis |
+| Embeddings | `gemini-embedding-001` @ 768 dims | Matches the Qdrant schema; new writes only, no re-embed needed |
+
+> Note: `text-embedding-004` does not exist on the live Gemini API (verified —
+> it returns 404; only `gemini-embedding-001/2` support `embedContent`).
+
+### Semantic Memory (hybrid retrieval)
 Every conversation is analyzed by Gemini to extract memorable facts →
-embedded → stored in Qdrant. Future queries are semantically matched to
-relevant memories, making Finley feel like it actually knows the user.
+embedded → stored in Qdrant **with structured payload fields**
+(`ticker`, `metric_type`, `date`, `source`) kept as filterable fields,
+never inside the text. Retrieval fuses two signals with RRF:
+top-20 via BM25-style sparse vectors + top-20 via dense vectors, returning
+the top 5 — with a noise gate so an uninformative lexical side can't demote
+a good semantic hit. Legacy dense-only collections are migrated
+automatically (additive where the server supports it, otherwise a
+count-verified scroll → recreate → re-upsert that preserves vectors
+bit-for-bit). Future queries are matched against relevant memories, making
+Finley feel like it actually knows the user. MongoDB remains the fallback
+when Qdrant is unavailable.
+
+### Performance & Cost
+- **Parallel dispatch** — independent tool calls and context reads
+  (memory search + history fetch) overlap via `asyncio.gather`.
+- **Async memory writes** — conversation saves are fire-and-forget with a
+  done-callback, so responses never block on persistence; one failed insert
+  can't skip its sibling or the memory extraction.
+- **Token reduction** — LLM-bound tool payloads are capped at line
+  boundaries; conversation history over 6 messages compresses to the stored
+  `memory_summary` (refreshed every 5 turns) + the last 3 messages verbatim.
+  Measured ~74% history-token cut on a 12-message fixture.
+
+### Observability
+Structured, greppable log lines (no message content, no secrets):
+```
+LATENCY | component=<telegram_request|agent_request|gemini_call|tool_call|memory_read|memory_write|persist|telegram_send> | duration=<s> | extra=<ctx>
+TOKENS  | input=<n> | output=<n> | extra=<path>
+```
+`extra` on `gemini_call` carries `model=` + pool size; per-key rotation
+remains visible in the existing cooldown warnings. Works with both `text`
+and `json` (`LOG_FORMAT`) log modes.
 
 ---
 
