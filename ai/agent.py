@@ -5,8 +5,10 @@ This is the brain — takes a user message and returns Finley's response.
 Handles: context building, memory retrieval, tool calling, response formatting.
 """
 import asyncio
+import functools
 import logging
 import re
+import time
 from typing import Dict, Any, List, Optional
 
 from ai.gateway import get_gateway
@@ -17,6 +19,52 @@ from db.crud import get_recent_history, save_message, get_user
 from config import settings
 
 logger = logging.getLogger("finbot")
+
+
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
+
+
+def _process_extra(self, user_id: int, *args, **kwargs) -> str:
+    msg_type = kwargs.get("message_type", args[1] if len(args) > 1 else "text")
+    return f"user={user_id} type={msg_type}"
+
+
+def _persist_extra(self, user_id: int, *args, **kwargs) -> str:
+    return f"user={user_id}"
+
+
+def _log_persist_result(task: asyncio.Task) -> None:
+    """Done-callback for the fire-and-forget persist task (Step 4).
+
+    _persist already guards its own body, so reaching here with an exception
+    means something truly unexpected (e.g. cancellation). Log it — never
+    swallow silently.
+    """
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        logger.warning("Background persist task was cancelled")
+        return
+    if exc is not None:
+        logger.error("Background persist task failed: %s", exc)
 
 
 # ─── Tool-gating heuristics ───────────────────────────────────────────────────
@@ -64,6 +112,7 @@ class FinancialAgent:
     7. Async: store message, extract + update memories
     """
 
+    @_timed("agent_request", _process_extra)
     async def process(
         self,
         user_id: int,
@@ -86,26 +135,37 @@ class FinancialAgent:
         if not user:
             return "Something went wrong. Please send /start to begin."
 
-        # ── 2. Get relevant memories ──────────────────────────────────────────
-        # Skip for trivial short messages (greetings, thanks) to save a call
+        # ── 2+3. Independent context reads — run concurrently ─────────────────
+        # Memory search (Qdrant/Mongo) and history fetch (Mongo) depend only on
+        # user_id/content/settings; neither consumes the other's output, so
+        # they overlap via gather. Error semantics unchanged: search failures
+        # degrade to [], history failures still propagate.
+        # Skip search for trivial short messages (greetings, thanks) to save a call.
         memory_manager = get_memory_manager()
-        relevant_memories = []
-        if len(content.split()) >= 3 or _needs_tools(content):
+        needs_memory = len(content.split()) >= 3 or _needs_tools(content)
+
+        async def _safe_search() -> List[str]:
+            if not needs_memory:
+                return []
             try:
-                relevant_memories = await memory_manager.search(
+                return await memory_manager.search(
                     user_id, content, limit=settings.bot_max_memory_results
                 )
             except Exception as e:
                 logger.debug("Memory search failed for user %d: %s", user_id, e)
-                relevant_memories = []
+                return []
 
-        # ── 3. Get recent history ─────────────────────────────────────────────
-        history = await get_recent_history(user_id, limit=settings.bot_max_history)
-        # Convert to Gemini format (exclude very long messages to save tokens)
-        gemini_history = [
-            {"role": msg["role"], "content": _truncate(msg["content"], 500)}
-            for msg in history
-        ]
+        relevant_memories, history = await asyncio.gather(
+            _safe_search(),
+            get_recent_history(user_id, limit=settings.bot_max_history),
+        )
+        # Rolling compression (Step 5B): beyond the threshold, older turns are
+        # covered by the stored memory_summary — already injected into the
+        # system prompt by build_analyst_prompt — so only the most recent
+        # turns ride verbatim. Never compress the most recent 3.
+        gemini_history = _build_gemini_history(
+            history, user.get("memory_summary", "")
+        )
 
         # ── 5. Build personalized system prompt ───────────────────────────────
         system_prompt = build_analyst_prompt(user, relevant_memories)
@@ -153,17 +213,30 @@ class FinancialAgent:
         formatted = _format_for_telegram(response)
 
         # ── 9. Persist conversation (non-blocking) ────────────────────────────
-        asyncio.create_task(self._persist(user_id, content, formatted))
+        # Fire-and-forget: the response above never depends on these writes
+        # (future turns read them via get_recent_history / memory search).
+        # The done-callback keeps failures visible instead of swallowed.
+        persist_task = asyncio.create_task(self._persist(user_id, content, formatted))
+        persist_task.add_done_callback(_log_persist_result)
 
         return formatted
 
+    @_timed("persist", _persist_extra)
     async def _persist(self, user_id: int, user_msg: str, assistant_msg: str):
         """Persist messages and update memories asynchronously."""
         try:
-            await asyncio.gather(
+            # return_exceptions: one failed insert must not skip the sibling
+            # save or the extraction below — each failure is logged, not fatal.
+            results = await asyncio.gather(
                 save_message(user_id, "user", user_msg),
                 save_message(user_id, "assistant", assistant_msg),
+                return_exceptions=True,
             )
+            for r in results:
+                if isinstance(r, BaseException):
+                    logger.warning(
+                        "Message save failed for user %d: %s", user_id, r,
+                    )
             # Extract memories from this exchange (non-blocking)
             memory_manager = get_memory_manager()
             await memory_manager.extract_and_store(user_id, [
@@ -183,6 +256,29 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "..."
+
+
+# Step 5B tuning: compress only when history exceeds the threshold, keep the
+# most recent turns verbatim, and never strand a young conversation that has
+# no stored summary yet (keep 6 verbatim instead of 3 in that case).
+HISTORY_COMPRESS_THRESHOLD = 6
+HISTORY_KEEP_VERBATIM = 3
+HISTORY_KEEP_NO_SUMMARY = 6
+
+
+def _build_gemini_history(history: List[Dict[str, Any]], memory_summary: str) -> List[Dict[str, str]]:
+    """Build the LLM-bound history with rolling context compression."""
+    if len(history) <= HISTORY_COMPRESS_THRESHOLD:
+        selected = history
+    elif (memory_summary or "").strip():
+        selected = history[-HISTORY_KEEP_VERBATIM:]
+    else:
+        selected = history[-HISTORY_KEEP_NO_SUMMARY:]
+    # Exclude very long messages to save tokens
+    return [
+        {"role": msg["role"], "content": _truncate(msg["content"], 500)}
+        for msg in selected
+    ]
 
 
 def _format_for_telegram(text: str) -> str:

@@ -8,6 +8,7 @@ This gives us 3x the free quota: ~4,500 requests/day for a demo.
 Uses the new `google.genai` SDK (google-generativeai is deprecated).
 """
 import asyncio
+import functools
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,63 @@ from config import settings
 logger = logging.getLogger("finbot")
 
 
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions.
+
+    Applied only to the outermost gateway calls, never inside the retry/
+    rotation loop. extra_fn (if given) builds the trailing context string;
+    it must never include prompts, history, or results (OWASP A09).
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
+
+
+def _gemini_extra(self, *args, **kwargs) -> str:
+    """Best-effort call context without touching the rotation internals.
+
+    Per-call key index is intentionally NOT plumbed here (that would mean
+    editing the fallback loop); key identity remains in the existing
+    per-rotation warning logs. keys=N shows the pool size in play.
+    """
+    model = kwargs.get("model", getattr(self, "FAST_MODEL", "?"))
+    return f"model={model} keys={len(getattr(self, 'clients', []))}"
+
+
+def _log_usage(response: Any, where: str) -> None:
+    """Step 5 token meter — reads Gemini usage metadata, never alters flow.
+
+    Emits a parseable TOKENS line per successful model response. Absent
+    metadata (mocks, older SDK payloads) simply logs nothing.
+    """
+    try:
+        um = getattr(response, "usage_metadata", None)
+        if um is None:
+            return
+        logger.info(
+            "TOKENS | input=%s | output=%s | extra=%s",
+            getattr(um, "prompt_token_count", 0) or 0,
+            getattr(um, "candidates_token_count", 0) or 0,
+            where,
+        )
+    except Exception:
+        pass
+
+
 class GeminiGateway:
     """
     Thread-safe multi-key Gemini gateway with automatic rotation.
@@ -29,9 +87,12 @@ class GeminiGateway:
         response = await gateway.generate(prompt, system_prompt=..., history=...)\
     """
 
-    FAST_MODEL = "gemini-3.6-flash"      # High quota, fast — use for most requests
-    SMART_MODEL = "gemini-2.5-pro"       # More capable — use for complex analysis
-    EMBED_MODEL = "gemini-embedding-001"  # 768-dim embeddings (matches Qdrant collection)
+    FAST_MODEL = "gemini-3.1-flash-lite"  # High quota, fast — use for most requests
+    SMART_MODEL = "gemini-3.5-flash"        # More capable — use for complex analysis
+    # NOTE: text-embedding-004 was specified in the upgrade brief but 404s on the
+    # live API (verified 2026-10-11: only gemini-embedding-001/2 exist).
+    # gemini-embedding-001 @ 768 dims matches the Qdrant collection schema.
+    EMBED_MODEL = "gemini-embedding-001"    # 768-dim embeddings (matches Qdrant collection)
 
     MAX_ATTEMPTS = 6  # Retry cap across all keys — never recurse forever
 
@@ -120,6 +181,7 @@ class GeminiGateway:
 
     # ─── Core generation ──────────────────────────────────────────────────────
 
+    @_timed("gemini_call", _gemini_extra)
     async def generate(
         self,
         prompt: str,
@@ -169,6 +231,7 @@ class GeminiGateway:
                             model=model, history=gemini_history, config=config
                         )
                         response = await chat.send_message(prompt)
+                        _log_usage(response, "path=byok_direct")
                         if response.text:
                             return response.text
                         last_finish = getattr(response, "finish_reason", None)
@@ -213,6 +276,7 @@ class GeminiGateway:
                         config=config,
                     )
                     response = await chat.send_message(prompt)
+                    _log_usage(response, "path=pool_direct")
                     if response.text:
                         return response.text
                     last_finish = getattr(response, "finish_reason", None)
@@ -243,7 +307,9 @@ class GeminiGateway:
         """Send a chat message, retrying transient 429/5xx errors in place."""
         for attempt in range(attempts):
             try:
-                return await chat.send_message(content)
+                response = await chat.send_message(content)
+                _log_usage(response, "path=agentic")
+                return response
             except Exception as e:
                 if not self._is_transient(e):
                     raise
@@ -296,9 +362,25 @@ class GeminiGateway:
                 )
                 return "I couldn't generate a response."
 
-            # Execute all tool calls
+            # Execute all tool calls from this round concurrently.
+            # Calls within one round are independent (each carries only its own
+            # args + user_id; round N+1 depends on round N via chat history and
+            # therefore stays sequential). A single tool must never crash the
+            # round: unexpected per-tool failures degrade to error strings.
+            async def _safe_execute(fc) -> str:
+                try:
+                    return await execute_tool(fc.name, dict(fc.args), user_id=user_id)
+                except asyncio.CancelledError:
+                    raise  # task cancellation is control flow, not a tool error
+                except Exception as e:
+                    logger.warning(
+                        "Agentic tool %s failed gracefully: %s",
+                        getattr(fc, "name", "?"), type(e).__name__,
+                    )
+                    return f"Tool {getattr(fc, 'name', '?')} encountered an error: {e}"
+
             tool_results = await asyncio.gather(*[
-                execute_tool(fc.name, dict(fc.args), user_id=user_id)
+                _safe_execute(fc)
                 for fc in function_calls
             ])
 
@@ -404,6 +486,7 @@ class GeminiGateway:
 
         raise RuntimeError("All Gemini API keys are exhausted for file upload.")
 
+    @_timed("gemini_file_call", _gemini_extra)
     async def generate_with_file(
         self,
         uploaded_file: Any,
@@ -428,6 +511,7 @@ class GeminiGateway:
                         max_output_tokens=2048,
                     ),
                 )
+                _log_usage(response, "path=file")
                 return response.text or ""
             except Exception as e:
                 if not self._is_transient(e):

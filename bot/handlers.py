@@ -4,10 +4,12 @@ Routes all incoming messages (text, voice, document, image) to the AI agent.
 Manages typing indicators, error handling, and response formatting.
 """
 import asyncio
+import functools
 import logging
 import os
 import re
 import tempfile
+import time
 from typing import Optional
 
 from telegram import Update, Message
@@ -33,6 +35,41 @@ from services.media.documents import analyze_document, analyze_image, download_d
 from services.google.gmail import get_authorization_url
 
 logger = logging.getLogger("finbot")
+
+
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
+
+
+def _request_extra(update, *args, **kwargs) -> str:
+    try:
+        return f"user={update.effective_user.id}"
+    except Exception:
+        return "user=?"
+
+
+def _send_extra(update, text: str = "", *args, **kwargs) -> str:
+    try:
+        return f"chars={len(text)}"
+    except Exception:
+        return ""
 
 # Pending voice transcriptions awaiting user confirm (Phase 2 stretch)
 _pending_voice: dict[int, tuple[str, bool]] = {}  # user_id -> (transcription, is_onboarding)
@@ -998,6 +1035,7 @@ async def handle_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ─── Main Message Handlers ────────────────────────────────────────────────────
 
+@_timed("telegram_request", _request_extra)
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all text messages — the main interaction flow."""
     if not await _gate(update):
@@ -1397,6 +1435,7 @@ async def _send_response_to_chat(message, text: str) -> None:
             await asyncio.sleep(0.3)
 
 
+@_timed("telegram_send", _send_extra)
 async def _send_response(update: Update, text: str) -> None:
     """
     Send a response, splitting into multiple messages if too long.
