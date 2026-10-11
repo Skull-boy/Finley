@@ -51,6 +51,22 @@ def _persist_extra(self, user_id: int, *args, **kwargs) -> str:
     return f"user={user_id}"
 
 
+def _log_persist_result(task: asyncio.Task) -> None:
+    """Done-callback for the fire-and-forget persist task (Step 4).
+
+    _persist already guards its own body, so reaching here with an exception
+    means something truly unexpected (e.g. cancellation). Log it — never
+    swallow silently.
+    """
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        logger.warning("Background persist task was cancelled")
+        return
+    if exc is not None:
+        logger.error("Background persist task failed: %s", exc)
+
+
 # ─── Tool-gating heuristics ───────────────────────────────────────────────────
 
 _TOOL_KEYWORDS = re.compile(
@@ -195,7 +211,11 @@ class FinancialAgent:
         formatted = _format_for_telegram(response)
 
         # ── 9. Persist conversation (non-blocking) ────────────────────────────
-        asyncio.create_task(self._persist(user_id, content, formatted))
+        # Fire-and-forget: the response above never depends on these writes
+        # (future turns read them via get_recent_history / memory search).
+        # The done-callback keeps failures visible instead of swallowed.
+        persist_task = asyncio.create_task(self._persist(user_id, content, formatted))
+        persist_task.add_done_callback(_log_persist_result)
 
         return formatted
 
@@ -203,10 +223,18 @@ class FinancialAgent:
     async def _persist(self, user_id: int, user_msg: str, assistant_msg: str):
         """Persist messages and update memories asynchronously."""
         try:
-            await asyncio.gather(
+            # return_exceptions: one failed insert must not skip the sibling
+            # save or the extraction below — each failure is logged, not fatal.
+            results = await asyncio.gather(
                 save_message(user_id, "user", user_msg),
                 save_message(user_id, "assistant", assistant_msg),
+                return_exceptions=True,
             )
+            for r in results:
+                if isinstance(r, BaseException):
+                    logger.warning(
+                        "Message save failed for user %d: %s", user_id, r,
+                    )
             # Extract memories from this exchange (non-blocking)
             memory_manager = get_memory_manager()
             await memory_manager.extract_and_store(user_id, [
