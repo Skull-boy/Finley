@@ -214,3 +214,42 @@ async def revoke_google_token(token_data) -> bool:
     except Exception as e:
         logger.warning("Google token revoke failed: %s", type(e).__name__)
         return False
+
+
+def extract_raw_token(token_data) -> Optional[str]:
+    """
+    Extract a raw OAuth token string (access or refresh) from stored data.
+    Accepts a Fernet-encrypted blob, a plaintext dict, or a raw string.
+    Returns None when no usable token is present. Never logs the token.
+    """
+    try:
+        if isinstance(token_data, str):
+            from security.token_crypto import decrypt_token_blob
+            try:
+                token_data = decrypt_token_blob(token_data)
+            except Exception:
+                # Not an encrypted blob — treat as a raw token string.
+                pass
+        if isinstance(token_data, dict):
+            return token_data.get("token") or token_data.get("refresh_token") or None
+        elif isinstance(token_data, str):
+            return token_data or None
+        return None
+    except Exception:
+        return None
+
+
+async def revoke(token: str) -> None:
+    """Revoke a raw Google OAuth token server-side. Raises on failure."""
+    import httpx
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/revoke",
+            params={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        if response.status_code != 200:
+            raise Exception(
+                f"Google revocation returned {response.status_code}: "
+                f"{response.text}"
+            )

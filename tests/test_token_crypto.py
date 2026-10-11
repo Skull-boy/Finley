@@ -11,11 +11,14 @@ from security.token_crypto import encrypt_token_blob, decrypt_token_blob
 
 
 SAMPLE_TOKENS = {
-    "token": "ya29.a0AfH6SMC-access-token",
-    "refresh_token": "1//0gH4-secret-refresh-token-that-must-never-be-plaintext",
+    # Deliberately vendor-neutral fakes: no real-vendor token prefixes and
+    # no provider hostnames, so secret scanners stay silent. The
+    # crypto tests only need opaque non-empty strings, never real shapes.
+    "token": "fake-access-token-for-tests-only-0001",
+    "refresh_token": "fake-refresh-token-for-tests-only-0001",
     "token_uri": "https://oauth2.googleapis.com/token",
-    "client_id": "1234567890.apps.googleusercontent.com",
-    "client_secret": "GOCSPX-very-secret",
+    "client_id": "fake-test-client-id-0001",
+    "client_secret": "fake-test-client-secret-0001",
     "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
 }
 
