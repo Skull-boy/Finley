@@ -119,21 +119,30 @@ class FinancialAgent:
         if not user:
             return "Something went wrong. Please send /start to begin."
 
-        # ── 2. Get relevant memories ──────────────────────────────────────────
-        # Skip for trivial short messages (greetings, thanks) to save a call
+        # ── 2+3. Independent context reads — run concurrently ─────────────────
+        # Memory search (Qdrant/Mongo) and history fetch (Mongo) depend only on
+        # user_id/content/settings; neither consumes the other's output, so
+        # they overlap via gather. Error semantics unchanged: search failures
+        # degrade to [], history failures still propagate.
+        # Skip search for trivial short messages (greetings, thanks) to save a call.
         memory_manager = get_memory_manager()
-        relevant_memories = []
-        if len(content.split()) >= 3 or _needs_tools(content):
+        needs_memory = len(content.split()) >= 3 or _needs_tools(content)
+
+        async def _safe_search() -> List[str]:
+            if not needs_memory:
+                return []
             try:
-                relevant_memories = await memory_manager.search(
+                return await memory_manager.search(
                     user_id, content, limit=settings.bot_max_memory_results
                 )
             except Exception as e:
                 logger.debug("Memory search failed for user %d: %s", user_id, e)
-                relevant_memories = []
+                return []
 
-        # ── 3. Get recent history ─────────────────────────────────────────────
-        history = await get_recent_history(user_id, limit=settings.bot_max_history)
+        relevant_memories, history = await asyncio.gather(
+            _safe_search(),
+            get_recent_history(user_id, limit=settings.bot_max_history),
+        )
         # Convert to Gemini format (exclude very long messages to save tokens)
         gemini_history = [
             {"role": msg["role"], "content": _truncate(msg["content"], 500)}

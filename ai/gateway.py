@@ -335,9 +335,25 @@ class GeminiGateway:
                 )
                 return "I couldn't generate a response."
 
-            # Execute all tool calls
+            # Execute all tool calls from this round concurrently.
+            # Calls within one round are independent (each carries only its own
+            # args + user_id; round N+1 depends on round N via chat history and
+            # therefore stays sequential). A single tool must never crash the
+            # round: unexpected per-tool failures degrade to error strings.
+            async def _safe_execute(fc) -> str:
+                try:
+                    return await execute_tool(fc.name, dict(fc.args), user_id=user_id)
+                except asyncio.CancelledError:
+                    raise  # task cancellation is control flow, not a tool error
+                except Exception as e:
+                    logger.warning(
+                        "Agentic tool %s failed gracefully: %s",
+                        getattr(fc, "name", "?"), type(e).__name__,
+                    )
+                    return f"Tool {getattr(fc, 'name', '?')} encountered an error: {e}"
+
             tool_results = await asyncio.gather(*[
-                execute_tool(fc.name, dict(fc.args), user_id=user_id)
+                _safe_execute(fc)
                 for fc in function_calls
             ])
 
