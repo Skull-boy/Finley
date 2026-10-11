@@ -6,6 +6,12 @@ All offline, no network.
 import pytest
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, patch, MagicMock
+from cryptography.fernet import Fernet
+
+# Valid-format Fernet key generated per test run — never hardcoded, so
+# secret scanners stay silent while prod-validation tests still exercise
+# the real TOKEN_ENCRYPTION_KEY-required code path.
+_TEST_FERNET_KEY = Fernet.generate_key().decode()
 
 
 # ─── Webhook config ────────────────────────────────────────────────────
@@ -38,7 +44,7 @@ def test_webhook_secret_required_in_prod(monkeypatch):
             telegram_webhook_secret="short",
             app_env="production",
             sec_contact_email="a@b.com",
-            token_encryption_key="Z6eN9mW-lagryyw9i6aQdaEZCrez5VnznpPhRwNpuUE=",
+            token_encryption_key=_TEST_FERNET_KEY,
         )
 
 
@@ -53,7 +59,7 @@ def test_webhook_valid_in_prod():
         telegram_webhook_secret="a-very-long-secret-32chars!!",
         app_env="production",
         sec_contact_email="a@b.com",
-        token_encryption_key="Z6eN9mW-lagryyw9i6aQdaEZCrez5VnznpPhRwNpuUE=",
+        token_encryption_key=_TEST_FERNET_KEY,
     )
     assert s.use_webhook is True
 

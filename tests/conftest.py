@@ -15,5 +15,9 @@ os.environ.setdefault("FINNHUB_API_KEY", "test-finnhub-key")
 os.environ.setdefault("QDRANT_URL", "")
 os.environ.setdefault("QDRANT_API_KEY", "")
 os.environ.setdefault("APP_ENV", "test")
-os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "Z6eN9mW-lagryyw9i6aQdaEZCrez5VnznpPhRwNpuUE=")
+# Fernet test key is generated fresh per pytest run — no key material is
+# ever hardcoded, so secret scanners stay silent. All tests in one run
+# share it (set here at import, before config.settings is created).
+from cryptography.fernet import Fernet as _Fernet
+os.environ.setdefault("TOKEN_ENCRYPTION_KEY", _Fernet.generate_key().decode())
 os.environ.setdefault("ALLOWED_USER_IDS", "")
