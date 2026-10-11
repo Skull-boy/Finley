@@ -5,8 +5,10 @@ This is the brain — takes a user message and returns Finley's response.
 Handles: context building, memory retrieval, tool calling, response formatting.
 """
 import asyncio
+import functools
 import logging
 import re
+import time
 from typing import Dict, Any, List, Optional
 
 from ai.gateway import get_gateway
@@ -17,6 +19,36 @@ from db.crud import get_recent_history, save_message, get_user
 from config import settings
 
 logger = logging.getLogger("finbot")
+
+
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
+
+
+def _process_extra(self, user_id: int, *args, **kwargs) -> str:
+    msg_type = kwargs.get("message_type", args[1] if len(args) > 1 else "text")
+    return f"user={user_id} type={msg_type}"
+
+
+def _persist_extra(self, user_id: int, *args, **kwargs) -> str:
+    return f"user={user_id}"
 
 
 # ─── Tool-gating heuristics ───────────────────────────────────────────────────
@@ -64,6 +96,7 @@ class FinancialAgent:
     7. Async: store message, extract + update memories
     """
 
+    @_timed("agent_request", _process_extra)
     async def process(
         self,
         user_id: int,
@@ -157,6 +190,7 @@ class FinancialAgent:
 
         return formatted
 
+    @_timed("persist", _persist_extra)
     async def _persist(self, user_id: int, user_msg: str, assistant_msg: str):
         """Persist messages and update memories asynchronously."""
         try:

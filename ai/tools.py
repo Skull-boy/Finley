@@ -8,9 +8,35 @@ No user command needed — just natural language.
 Uses the new `google.genai` SDK types.
 """
 import asyncio
+import functools
+import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from google.genai import types
+
+logger = logging.getLogger("finbot")
+
+
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
 
 
 # ─── Tool Declarations ────────────────────────────────────────────────────────
@@ -202,6 +228,7 @@ def _make_tools() -> types.Tool:
 # ─── Tool Executor ────────────────────────────────────────────────────────────
 
 
+@_timed("tool_call", lambda tool_name, *a, **k: f"tool={tool_name}")
 async def execute_tool(tool_name: str, args: Dict[str, Any], user_id: Optional[int] = None) -> str:
     """
     Route a tool call to the appropriate service function.

@@ -10,8 +10,10 @@ This is what makes Finley remember "last month you asked about NVDA earnings"
 and "you mentioned you prefer concise responses."
 """
 import asyncio
+import functools
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
@@ -22,6 +24,37 @@ from db.crud import (
 )
 
 logger = logging.getLogger("finbot")
+
+
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions."""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
+
+
+def _search_extra(self, user_id: int, *args, **kwargs) -> str:
+    limit = kwargs.get("limit", args[1] if len(args) > 1 else "?")
+    return f"user={user_id} limit={limit}"
+
+
+def _extract_extra(self, user_id: int, conversation=None, *args, **kwargs) -> str:
+    n = len(conversation) if isinstance(conversation, list) else "?"
+    return f"user={user_id} turns={n}"
 
 
 class MemoryManager:
@@ -101,6 +134,7 @@ Return ONLY the updated summary text."""
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
+    @_timed("memory_write", _extract_extra)
     async def extract_and_store(self, user_id: int, conversation: List[Dict[str, str]]) -> None:
         """
         Extract memorable facts from a conversation and store them.
@@ -184,6 +218,7 @@ Return ONLY the updated summary text."""
         except Exception:
             pass
 
+    @_timed("memory_read", _search_extra)
     async def search(self, user_id: int, query: str, limit: int = 5) -> List[str]:
         """
         Retrieve memories most relevant to the current query.

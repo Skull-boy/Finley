@@ -8,6 +8,7 @@ This gives us 3x the free quota: ~4,500 requests/day for a demo.
 Uses the new `google.genai` SDK (google-generativeai is deprecated).
 """
 import asyncio
+import functools
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,43 @@ from google.genai import types
 from config import settings
 
 logger = logging.getLogger("finbot")
+
+
+def _timed(component: str, extra_fn=None):
+    """Step 2 latency probe — logs duration, never alters logic or exceptions.
+
+    Applied only to the outermost gateway calls, never inside the retry/
+    rotation loop. extra_fn (if given) builds the trailing context string;
+    it must never include prompts, history, or results (OWASP A09).
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                try:
+                    _extra = extra_fn(*args, **kwargs) if extra_fn else ""
+                except Exception:
+                    _extra = ""
+                logger.info(
+                    "LATENCY | component=%s | duration=%.3f | extra=%s",
+                    component, time.perf_counter() - _t0, _extra,
+                )
+        return wrapper
+    return deco
+
+
+def _gemini_extra(self, *args, **kwargs) -> str:
+    """Best-effort call context without touching the rotation internals.
+
+    Per-call key index is intentionally NOT plumbed here (that would mean
+    editing the fallback loop); key identity remains in the existing
+    per-rotation warning logs. keys=N shows the pool size in play.
+    """
+    model = kwargs.get("model", getattr(self, "FAST_MODEL", "?"))
+    return f"model={model} keys={len(getattr(self, 'clients', []))}"
 
 
 class GeminiGateway:
@@ -120,6 +158,7 @@ class GeminiGateway:
 
     # ─── Core generation ──────────────────────────────────────────────────────
 
+    @_timed("gemini_call", _gemini_extra)
     async def generate(
         self,
         prompt: str,
@@ -404,6 +443,7 @@ class GeminiGateway:
 
         raise RuntimeError("All Gemini API keys are exhausted for file upload.")
 
+    @_timed("gemini_file_call", _gemini_extra)
     async def generate_with_file(
         self,
         uploaded_file: Any,
