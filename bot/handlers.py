@@ -1001,30 +1001,65 @@ async def handle_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Revoke the Google integration — required before a user can re-auth."""
+    """Revoke the Google integration server-side, then clear local tokens.
+
+    Flow: read the stored token BEFORE deleting anything, attempt
+    server-side revocation via gmail.revoke(), then ALWAYS clear the local
+    record. The reply is honest about the outcome so the user knows whether
+    to also revoke manually at myaccount.google.com/permissions.
+    """
     if not await _gate(update, rate_limited=False):
         return
     user_id = update.effective_user.id
     try:
-        # Try server-side revoke first (best-effort), then clear DB regardless
+        # Get token BEFORE deleting any record.
+        raw_token = None
         try:
             from db.crud import get_user as _get_user
-            from services.google.gmail import revoke_google_token
+            from services.google.gmail import extract_raw_token as _extract_token
             u = await _get_user(user_id)
             token_blob = (u or {}).get("integrations", {}).get("gmail", {}).get("token")
             if token_blob:
-                await revoke_google_token(token_blob)
+                raw_token = _extract_token(token_blob)
         except Exception as e:
-            logger.warning("Disconnect revoke pre-check failed for user %d: %s", user_id, type(e).__name__)
+            logger.warning("Disconnect token lookup failed for user %d: %s", user_id, type(e).__name__)
+            raw_token = None
+
+        # Attempt server-side revocation (only if a token exists).
+        revocation_ok = False
+        if raw_token:
+            try:
+                from services.google.gmail import revoke as _revoke
+                await _revoke(raw_token)
+                revocation_ok = True
+            except Exception as e:
+                logger.warning("Disconnect Google revocation failed for user %d: %s", user_id, type(e).__name__)
+
+        # Always delete the local record regardless of revocation result.
         await update_user(user_id, {
             "integrations.gmail": {"connected": False, "token": None, "email": None},
             "integrations.google_calendar": {"connected": False, "token": None},
         })
-        await update.message.reply_text(
-            "🔌 Disconnected your Google account. You can re-link it anytime "
-            "by saying <i>\"connect gmail\"</i>.",
-            parse_mode=ParseMode.HTML
-        )
+
+        if not raw_token:
+            await update.message.reply_text(
+                "🔌 Disconnected your Google account. You can re-link it anytime "
+                "by saying <i>\"connect gmail\"</i>.",
+                parse_mode=ParseMode.HTML
+            )
+        elif revocation_ok:
+            await update.message.reply_text(
+                "🔌 Disconnected. Google access has been fully revoked. "
+                "You can re-link anytime by saying <i>\"connect gmail\"</i>.",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(
+                "🔌 Unlinked locally, but Google revocation failed — "
+                "your access may still be active. Revoke manually at "
+                "myaccount.google.com/permissions",
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
         logger.error("Disconnect failed for user %d: %s", user_id, e)
         await update.message.reply_text(
