@@ -10,7 +10,7 @@ google-genai==2.18.1
 
 # ─── Database ────────────────────────────────────────────────────────────────
 motor==3.7.1               # Async MongoDB driver
-pymongo==4.17.0            # Sync MongoDB (for APScheduler)
+pymongo==4.18.3            # Sync MongoDB (for APScheduler)
 
 # ─── Vector Database ─────────────────────────────────────────────────────────
 qdrant-client==1.19.0
