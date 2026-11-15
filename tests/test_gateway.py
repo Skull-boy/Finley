@@ -156,3 +156,82 @@ def test_is_transient():
     assert GeminiGateway._is_transient(FakeServerError()) is True
     assert GeminiGateway._is_transient(FakeClientError(400)) is False
     assert GeminiGateway._is_transient(Exception("boom")) is False
+
+
+def test_gateway_models_are_configurable(monkeypatch):
+    """Model IDs must come from settings, never from source constants."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "gemini_fast_model", "fast-test-model")
+    monkeypatch.setattr(settings, "gemini_smart_model", "smart-test-model")
+    monkeypatch.setattr(settings, "embed_model", "embed-test-model")
+
+    gateway = GeminiGateway()
+
+    assert gateway.fast_model == "fast-test-model"
+    assert gateway.smart_model == "smart-test-model"
+    assert gateway.embed_model == "embed-test-model"
+    # Backward-compatible aliases point at the same configured values.
+    assert gateway.FAST_MODEL == "fast-test-model"
+    assert gateway.SMART_MODEL == "smart-test-model"
+    assert gateway.EMBED_MODEL == "embed-test-model"
+
+
+@pytest.mark.asyncio
+async def test_generate_uses_configured_fast_model(monkeypatch):
+    """A call without an explicit model must use GEMINI_FAST_MODEL."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "gemini_fast_model", "fast-test-model")
+    gateway = GeminiGateway()
+    captured = {}
+
+    class CaptureChat:
+        async def send_message(self, content):
+            return NS(
+                text="ok",
+                candidates=[NS(content=NS(parts=[NS(text="ok")]))],
+            )
+
+    class CaptureClient:
+        def __init__(self):
+            self.aio = NS(chats=NS(create=self._create))
+
+        def _create(self, **kwargs):
+            captured.update(kwargs)
+            return CaptureChat()
+
+    async def pick():
+        return (CaptureClient(), 0)
+
+    with patch.object(gateway, "_pick_client", new=pick):
+        assert await gateway.generate("hello") == "ok"
+
+    assert captured["model"] == "fast-test-model"
+
+
+@pytest.mark.asyncio
+async def test_embed_uses_configured_model_and_dimension(monkeypatch):
+    """Embedding requests must honor EMBED_MODEL and EMBEDDING_DIMENSION."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "embed_model", "embed-test-model")
+    monkeypatch.setattr(settings, "embedding_dimension", 123)
+    gateway = GeminiGateway()
+    captured = {}
+
+    def embed_content(**kwargs):
+        captured.update(kwargs)
+        return NS(embeddings=[NS(values=[0.1] * 123)])
+
+    client = NS(models=NS(embed_content=embed_content))
+
+    async def pick():
+        return (client, 0)
+
+    with patch.object(gateway, "_pick_client", new=pick):
+        vector = await gateway.embed("hello")
+
+    assert len(vector) == 123
+    assert captured["model"] == "embed-test-model"
+    assert captured["config"].output_dimensionality == 123

@@ -6,7 +6,7 @@ import re
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 
 class Settings(BaseSettings):
@@ -25,6 +25,54 @@ class Settings(BaseSettings):
         """Return all non-empty Gemini API keys for rotation."""
         return [k for k in [self.gemini_api_key_1, self.gemini_api_key_2, self.gemini_api_key_3] if k]
 
+    # ─── Gemini model selection ─────────────────────────────────────────────
+    # Model IDs are deployment configuration, not source code: Google retires
+    # and renames models, and self-hosted operators may use different tiers.
+    # Defaults are Flash models so they work on free-tier API keys. Point
+    # GEMINI_SMART_MODEL at a Pro model only when billing is enabled.
+    #
+    # List models available to a key:
+    #   python -c "from google import genai; c = genai.Client(api_key='KEY'); \
+    #              [print(m.name) for m in c.models.list()]"
+    gemini_fast_model: str = Field(
+        default="gemini-3.6-flash",
+        min_length=1,
+        description=(
+            "Gemini model for fast, high-volume requests such as quote "
+            "lookups and short Q&A. Must be available on your key tier."
+        ),
+    )
+    gemini_smart_model: str = Field(
+        default="gemini-3.5-flash",
+        min_length=1,
+        description=(
+            "Gemini model for complex reasoning tasks such as document "
+            "analysis and multi-step research. Must be available on your key "
+            "tier; a Pro model requires billing."
+        ),
+    )
+    embed_model: str = Field(
+        default="gemini-embedding-001",
+        min_length=1,
+        description=(
+            "Gemini embedding model for semantic memory. Must return "
+            "EMBEDDING_DIMENSION values. text-embedding-004 is documented by "
+            "older guides but returns 404 on the live API."
+        ),
+    )
+
+    # Default output cap for normal chat/file requests. Per-call code may
+    # override it (startup preflight uses a much smaller cap).
+    gemini_max_output_tokens: int = Field(
+        default=2048,
+        ge=1,
+        le=8192,
+        description=(
+            "Default maximum output tokens for Gemini generation. Lower it to "
+            "reduce free-tier quota burn; raise it only if responses are cut off."
+        ),
+    )
+
     # ─── MongoDB ────────────────────────────────────────────────────────────
     mongodb_uri: str
     mongodb_db_name: str = "finbot"
@@ -32,6 +80,28 @@ class Settings(BaseSettings):
     # ─── Qdrant ─────────────────────────────────────────────────────────────
     qdrant_url: str = ""
     qdrant_api_key: str = ""
+    # Collection that stores per-user semantic memories. Kept in config so
+    # self-hosted deployments can isolate environments (staging/prod) without
+    # editing source code.
+    qdrant_collection_name: str = Field(
+        default="finbot_memories",
+        min_length=1,
+        description=(
+            "Qdrant collection used for semantic memory. Change this when "
+            "running multiple environments against one Qdrant cluster."
+        ),
+    )
+    # Dimension produced by EMBED_MODEL. The gateway requests this size and
+    # startup preflight verifies the Qdrant collection matches. Changing the
+    # embedding model usually requires changing this value and re-embedding.
+    embedding_dimension: int = Field(
+        default=768,
+        ge=1,
+        description=(
+            "Vector dimension returned by the embedding model and stored in "
+            "Qdrant. Must match the collection schema."
+        ),
+    )
 
     # ─── Finnhub ────────────────────────────────────────────────────────────
     finnhub_api_key: str
@@ -50,6 +120,42 @@ class Settings(BaseSettings):
     app_port: int = 8000
     app_base_url: str = "http://localhost:8000"
     log_format: str = "text"  # text | json (Phase 2 structured logs)
+
+    # ─── Startup preflight ──────────────────────────────────────────────────
+    # Preflight makes deployment failures loud: a missing key, a retired
+    # model, or a Qdrant schema mismatch stops startup instead of surfacing
+    # as broken user requests. Values below are deliberately configurable so
+    # operators can tune startup cost without editing code.
+    preflight_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        description=(
+            "Maximum seconds for each Gemini/embedding startup check. "
+            "Qdrant uses its client's per-request timeout so schema work is "
+            "never cancelled mid-flight."
+        ),
+    )
+    preflight_prompt: str = Field(
+        default="Reply with the single word: ready",
+        min_length=1,
+        description="Minimal prompt used to verify Gemini reachability.",
+    )
+    preflight_embedding_text: str = Field(
+        default="preflight embedding check",
+        min_length=1,
+        description="Text embedded during startup to verify the embedding model.",
+    )
+    preflight_max_output_tokens: int = Field(
+        default=10,
+        ge=1,
+        le=2048,
+        description=(
+            "Output token cap for the Gemini preflight call. Keep this tiny: "
+            "the check only needs a non-empty response and should not consume "
+            "meaningful free-tier quota."
+        ),
+    )
 
     # ─── Telegram — webhook (Phase 1: production uses webhook, local uses polling) ─
     # If TELEGRAM_WEBHOOK_URL is set (e.g. https://finley.example.com/telegram/webhook),

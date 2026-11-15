@@ -54,7 +54,7 @@ def _gemini_extra(self, *args, **kwargs) -> str:
     editing the fallback loop); key identity remains in the existing
     per-rotation warning logs. keys=N shows the pool size in play.
     """
-    model = kwargs.get("model", getattr(self, "FAST_MODEL", "?"))
+    model = kwargs.get("model") or getattr(self, "fast_model", "?")
     return f"model={model} keys={len(getattr(self, 'clients', []))}"
 
 
@@ -82,24 +82,35 @@ class GeminiGateway:
     """
     Thread-safe multi-key Gemini gateway with automatic rotation.
 
+    Model IDs come from settings (GEMINI_FAST_MODEL, GEMINI_SMART_MODEL,
+    EMBED_MODEL) rather than class constants, so a model retirement can be
+    handled by changing deployment configuration instead of source code.
+
     Usage:
         gateway = GeminiGateway()
-        response = await gateway.generate(prompt, system_prompt=..., history=...)\
+        response = await gateway.generate(prompt, system_prompt=..., history=...)
     """
-
-    FAST_MODEL = "gemini-3.1-flash-lite"  # High quota, fast — use for most requests
-    SMART_MODEL = "gemini-3.5-flash"        # More capable — use for complex analysis
-    # NOTE: text-embedding-004 was specified in the upgrade brief but 404s on the
-    # live API (verified 2026-10-11: only gemini-embedding-001/2 exist).
-    # gemini-embedding-001 @ 768 dims matches the Qdrant collection schema.
-    EMBED_MODEL = "gemini-embedding-001"    # 768-dim embeddings (matches Qdrant collection)
 
     MAX_ATTEMPTS = 6  # Retry cap across all keys — never recurse forever
 
     def __init__(self):
+        """Create one client per configured key and resolve model IDs."""
         self.api_keys = settings.gemini_api_keys
         if not self.api_keys:
             raise ValueError("At least one Gemini API key required (GEMINI_API_KEY_1)")
+
+        # Resolve model IDs once at construction so all requests from this
+        # process use a consistent model even if os.environ changes later.
+        self.fast_model = settings.gemini_fast_model
+        self.smart_model = settings.gemini_smart_model
+        self.embed_model = settings.embed_model
+
+        # Backward-compatible aliases: earlier releases exposed these as
+        # class constants. Keep them on the instance for forks that read
+        # gateway.FAST_MODEL, but never store model IDs in source again.
+        self.FAST_MODEL = self.fast_model
+        self.SMART_MODEL = self.smart_model
+        self.EMBED_MODEL = self.embed_model
 
         # Create one client per key (30s request timeout so a hung upstream
         # can't occupy handler slots for the SDK's 600s default)
@@ -116,6 +127,14 @@ class GeminiGateway:
         # BYOK isolated per-user clients (Phase 1) — never shared, never falls back to pool
         self._byok_clients: Dict[int, tuple] = {}  # user_id → (client, key)
         self._byok_cooldowns: Dict[int, float] = {}  # user_id → cooldown_until
+
+        logger.info(
+            "Gemini models | fast=%s smart=%s embed=%s dim=%d",
+            self.fast_model,
+            self.smart_model,
+            self.embed_model,
+            settings.embedding_dimension,
+        )
 
         if len(self.api_keys) < 2:
             logger.warning(
@@ -188,20 +207,34 @@ class GeminiGateway:
         system_prompt: str = "",
         history: Optional[List[Dict]] = None,
         tools: Optional[Any] = None,
-        model: str = FAST_MODEL,
+        model: Optional[str] = None,
         temperature: float = 0.7,
         user_id: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         """
         Generate a response from Gemini.
         Automatically rotates keys on rate limit errors, with a bounded retry loop.
 
+        Args:
+            model: Optional model ID. Defaults to settings.gemini_fast_model.
+            max_output_tokens: Optional per-call output cap. Defaults to
+                settings.gemini_max_output_tokens. Startup preflight passes
+                a tiny cap so the health check barely touches free quota.
+
         Returns the text response string.
         """
+        model = model or self.fast_model
+        resolved_max_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else settings.gemini_max_output_tokens
+        )
+
         # Build config
         config = types.GenerateContentConfig(
             temperature=temperature,
-            max_output_tokens=2048,
+            max_output_tokens=resolved_max_tokens,
             system_instruction=system_prompt if system_prompt else None,
         )
         if tools is not None:
@@ -412,7 +445,7 @@ class GeminiGateway:
     # ─── Embedding generation ─────────────────────────────────────────────────
 
     async def embed(self, text: str, user_id: Optional[int] = None) -> List[float]:
-        """Generate a text embedding using Gemini's embedding model (768-dim)."""
+        """Generate a text embedding with the configured model and dimension."""
         # BYOK path for embeddings (isolated)
         if user_id is not None:
             byok_client = await self._get_byok_client(user_id)
@@ -420,9 +453,11 @@ class GeminiGateway:
                 try:
                     result = await asyncio.to_thread(
                         byok_client.models.embed_content,
-                        model=self.EMBED_MODEL,
+                        model=self.embed_model,
                         contents=text,
-                        config=types.EmbedContentConfig(output_dimensionality=768),
+                        config=types.EmbedContentConfig(
+                            output_dimensionality=settings.embedding_dimension
+                        ),
                     )
                     return result.embeddings[0].values if result.embeddings else []
                 except Exception as e:
@@ -442,9 +477,11 @@ class GeminiGateway:
             try:
                 result = await asyncio.to_thread(
                     client.models.embed_content,
-                    model=self.EMBED_MODEL,
+                    model=self.embed_model,
                     contents=text,
-                    config=types.EmbedContentConfig(output_dimensionality=768),
+                    config=types.EmbedContentConfig(
+                        output_dimensionality=settings.embedding_dimension
+                    ),
                 )
                 return result.embeddings[0].values if result.embeddings else []
             except Exception as e:
@@ -491,10 +528,23 @@ class GeminiGateway:
         self,
         uploaded_file: Any,
         prompt: str,
-        model: str = FAST_MODEL,
+        model: Optional[str] = None,
         temperature: float = 0.4,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
-        """Generate content from an uploaded file (audio/image/document)."""
+        """Generate content from an uploaded file (audio/image/document).
+
+        Args:
+            model: Optional model ID. Defaults to settings.gemini_fast_model;
+                callers may pass ``gateway.smart_model`` for heavier analysis.
+            max_output_tokens: Optional output cap; defaults to config.
+        """
+        model = model or self.fast_model
+        resolved_max_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else settings.gemini_max_output_tokens
+        )
         for _ in range(self.MAX_ATTEMPTS):
             client, key_idx = await self._pick_client()
 
@@ -508,7 +558,7 @@ class GeminiGateway:
                     contents=[uploaded_file, prompt],
                     config=types.GenerateContentConfig(
                         temperature=temperature,
-                        max_output_tokens=2048,
+                        max_output_tokens=resolved_max_tokens,
                     ),
                 )
                 _log_usage(response, "path=file")
