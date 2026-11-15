@@ -99,6 +99,127 @@ telegram_app: Application = None
 # ─── Startup helpers ──────────────────────────────────────────────────────────
 
 
+async def _run_preflight_checks() -> None:
+    """
+    Verify critical integrations before the bot accepts any user traffic.
+
+    Checks performed, in order:
+      1. TOKEN_ENCRYPTION_KEY — present in production and valid Fernet format
+      2. Gemini API — at least one configured key returns a non-empty response
+      3. Embedding model — returns a non-empty vector of the configured size
+      4. Qdrant — collection exists (or can be created) with the right schema
+
+    Raises:
+        RuntimeError: If a configured integration is broken. Startup stops;
+        the process never begins polling or serving webhooks.
+
+    Why this exists:
+        Unit tests mock upstream calls and cannot catch retired model IDs,
+        revoked/expired API keys, or Qdrant schema drift. Those failures used
+        to appear only when a user sent a message. Preflight turns them into
+        an immediate deployment failure with an actionable error message.
+
+    Why it runs before MongoDB:
+        These checks do not need the database. Running them first means a
+        failed preflight exits without leaving Mongo connections or Telegram
+        resources open. The key itself is never logged.
+    """
+    from ai.gateway import get_gateway
+    from ai.memory import get_memory_manager
+    from security.token_crypto import validate_token_encryption_key
+
+    logger.info("Running preflight checks...")
+    timeout = settings.preflight_timeout_seconds
+
+    # --- Check 1: token encryption key ---
+    try:
+        validate_token_encryption_key()
+    except Exception as e:
+        detail = str(e) or type(e).__name__
+        raise RuntimeError(
+            f"Preflight failed — TOKEN_ENCRYPTION_KEY is missing or invalid: "
+            f"{detail}"
+        ) from e
+    logger.info("Preflight check 1/4 passed — TOKEN_ENCRYPTION_KEY valid")
+
+    # --- Check 2: Gemini API reachability ---
+    try:
+        gateway = get_gateway()
+        response = await asyncio.wait_for(
+            gateway.generate(
+                settings.preflight_prompt,
+                max_output_tokens=settings.preflight_max_output_tokens,
+            ),
+            timeout=timeout,
+        )
+        if not response or not response.strip():
+            raise RuntimeError("Gemini returned an empty response")
+    except Exception as e:
+        detail = str(e) or type(e).__name__
+        raise RuntimeError(
+            f"Preflight failed — Gemini API unreachable or broken: {detail}. "
+            "Check GEMINI_API_KEY_1 (and GEMINI_API_KEY_2/3 if configured), "
+            "GEMINI_FAST_MODEL, and the key's free-tier quota."
+        ) from e
+    logger.info("Preflight check 2/4 passed — Gemini API reachable")
+
+    # --- Check 3: embedding model ---
+    try:
+        vector = await asyncio.wait_for(
+            gateway.embed(settings.preflight_embedding_text),
+            timeout=timeout,
+        )
+        if not vector:
+            raise RuntimeError("embedding model returned an empty vector")
+        if len(vector) != settings.embedding_dimension:
+            raise RuntimeError(
+                f"embedding dimension mismatch: expected "
+                f"{settings.embedding_dimension}, got {len(vector)}"
+            )
+    except Exception as e:
+        detail = str(e) or type(e).__name__
+        raise RuntimeError(
+            f"Preflight failed — embedding model broken: {detail}. Check "
+            "EMBED_MODEL and EMBEDDING_DIMENSION."
+        ) from e
+    logger.info(
+        "Preflight check 3/4 passed — embedding model working (dim=%d)",
+        len(vector),
+    )
+
+    # --- Check 4: Qdrant collection schema ---
+    try:
+        memory_manager = get_memory_manager()
+        # No asyncio.wait_for here: creating/migrating a collection can take
+        # longer than a normal network call, and cancelling it mid-flight
+        # could leave storage half-written. The Qdrant client enforces its
+        # own per-request timeout.
+        status = await memory_manager.preflight()
+    except Exception as e:
+        detail = str(e) or type(e).__name__
+        raise RuntimeError(
+            f"Preflight failed — Qdrant memory check failed: {detail}. Check "
+            "QDRANT_URL, QDRANT_API_KEY, and QDRANT_COLLECTION_NAME."
+        ) from e
+
+    if status.get("skipped"):
+        # Semantic memory is optional; an unset QDRANT_URL is a supported
+        # local/offline configuration, not a broken integration.
+        logger.warning(
+            "Preflight check 4/4 skipped — %s", status.get("reason")
+        )
+    else:
+        logger.info(
+            "Preflight check 4/4 passed — Qdrant collection '%s' "
+            "(dim=%s, hybrid=%s)",
+            status.get("collection"),
+            status.get("dimension"),
+            status.get("hybrid_ready"),
+        )
+
+    logger.info("All preflight checks passed — starting bot")
+
+
 async def _connect_db_with_retry(max_attempts: int = 5, base_delay: float = 2.0) -> None:
     """Connect to MongoDB with exponential backoff — a brief DB outage at boot
     must not kill the whole app."""
@@ -164,6 +285,11 @@ async def lifespan(app: FastAPI):
     global telegram_app
 
     logger.info("🚀 Starting Finley Financial Assistant...")
+
+    # Fail fast before opening database connections or starting Telegram.
+    # A broken key/model/schema must be a loud deployment failure, not a
+    # stream of user-facing errors discovered after launch.
+    await _run_preflight_checks()
 
     # Connect to MongoDB (with retry/backoff)
     await _connect_db_with_retry()

@@ -8,10 +8,17 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, patch, MagicMock
 from cryptography.fernet import Fernet
 
-# Valid-format Fernet key generated per test run — never hardcoded, so
-# secret scanners stay silent while prod-validation tests still exercise
-# the real TOKEN_ENCRYPTION_KEY-required code path.
-_TEST_FERNET_KEY = Fernet.generate_key().decode()
+
+def _test_fernet_key() -> str:
+    """
+    Generate a fresh Fernet key for test fixtures.
+
+    A new key is generated each time a test needs one so no static key
+    string ever appears in source code. This prevents false positives from
+    secret scanners such as GitGuardian while still exercising the real
+    ``TOKEN_ENCRYPTION_KEY`` validation path in production-mode configs.
+    """
+    return Fernet.generate_key().decode()
 
 
 # ─── Webhook config ────────────────────────────────────────────────────
@@ -44,7 +51,7 @@ def test_webhook_secret_required_in_prod(monkeypatch):
             telegram_webhook_secret="short",
             app_env="production",
             sec_contact_email="a@b.com",
-            token_encryption_key=_TEST_FERNET_KEY,
+            token_encryption_key=_test_fernet_key(),
         )
 
 
@@ -59,7 +66,7 @@ def test_webhook_valid_in_prod():
         telegram_webhook_secret="a-very-long-secret-32chars!!",
         app_env="production",
         sec_contact_email="a@b.com",
-        token_encryption_key=_TEST_FERNET_KEY,
+        token_encryption_key=_test_fernet_key(),
     )
     assert s.use_webhook is True
 

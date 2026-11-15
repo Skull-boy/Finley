@@ -40,6 +40,11 @@ cp .env.example .env
 python main.py
 # Polling (dev) or webhook (prod via TELEGRAM_WEBHOOK_URL); FastAPI /health on :8000
 ```
+Startup runs a preflight check against `TOKEN_ENCRYPTION_KEY`, Gemini, the
+embedding model, and (when `QDRANT_URL` is set) the Qdrant collection. If a
+configured integration is broken the bot refuses to start and prints the exact
+setting to fix — this is intentional, so deployment failures are immediate
+instead of appearing as broken user requests.
 
 ---
 
@@ -76,8 +81,9 @@ Finley/
 │
 ├── ai/
 │   ├── gateway.py            # Multi-key pool + BYOK isolated + rotation + Files API
-│   │                         # Models: gemini-3.1-flash-lite (fast), gemini-3.5-flash (smart),
-│   │                         # gemini-embedding-001 @768d (google-genai SDK)
+│   │                         # Models: GEMINI_FAST_MODEL (default gemini-3.6-flash),
+│   │                         # GEMINI_SMART_MODEL (default gemini-3.5-flash),
+│   │                         # EMBED_MODEL (default gemini-embedding-001) @ EMBEDDING_DIMENSION
 │   ├── agent.py              # Orchestrator + injection guard (LLM01/02)
 │   │                         # Parallel context reads, rolling history compression, async persist
 │   ├── prompts.py            # Prompts + i18n hint
@@ -173,11 +179,15 @@ to an error string instead of crashing the round; rounds stay sequential
 because each depends on the previous round's results.
 
 ### Models (google-genai SDK)
-| Path | Model | Notes |
-|------|-------|-------|
-| Fast (default) | `gemini-3.1-flash-lite` | Free tier, most requests |
-| Smart | `gemini-3.5-flash` | Better reasoning, complex analysis |
-| Embeddings | `gemini-embedding-001` @ 768 dims | Matches the Qdrant schema; new writes only, no re-embed needed |
+Model IDs are environment configuration, never source constants. Both defaults
+are Flash models so they work on free-tier keys; point `GEMINI_SMART_MODEL` at
+a Pro model only when billing is enabled.
+
+| Path | Default | Notes |
+|------|---------|-------|
+| Fast (default) | `gemini-3.6-flash` | Free-tier Flash, most requests (`GEMINI_FAST_MODEL`) |
+| Smart | `gemini-3.5-flash` | Better reasoning for complex analysis (`GEMINI_SMART_MODEL`) |
+| Embeddings | `gemini-embedding-001` @ 768 dims | Free tier; size set by `EMBEDDING_DIMENSION` and checked at startup |
 
 > Note: `text-embedding-004` does not exist on the live Gemini API (verified —
 > it returns 404; only `gemini-embedding-001/2` support `embedContent`).

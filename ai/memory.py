@@ -185,6 +185,25 @@ def extract_metadata(fact: str, source: str = "user_query") -> Dict[str, Any]:
     }
 
 
+def _vector_size(vectors_config: Any) -> Optional[int]:
+    """
+    Read the dense-vector dimension from a Qdrant collection config.
+
+    Qdrant represents the default unnamed vector as a ``VectorParams``
+    object, but named-vector collections use a dict. Preflight accepts both
+    shapes so it can validate a schema without assuming one deployment style.
+    Returns None when no dimension can be read.
+    """
+    if isinstance(vectors_config, dict):
+        candidate = (
+            vectors_config.get("dense")
+            or vectors_config.get("")
+            or next(iter(vectors_config.values()), None)
+        )
+        return getattr(candidate, "size", None)
+    return getattr(vectors_config, "size", None)
+
+
 class MemoryManager:
     """
     Manages long-term semantic memory for users.
@@ -224,8 +243,12 @@ Return ONLY the updated summary text."""
 
     def __init__(self):
         self._qdrant_client = None
-        self._collection_name = "finbot_memories"
+        self._collection_name = settings.qdrant_collection_name
         self._qdrant_ready = False
+        # Set when the optional qdrant-client package is unavailable. Lets
+        # preflight skip memory in local installs while still failing a
+        # production deploy that is missing a required dependency.
+        self._qdrant_import_error: Optional[str] = None
         self._hybrid_ready = False  # sparse BM25 field present (Step 6B)
         self._schema_checked = False
         self._ensure_lock = asyncio.Lock()  # serialize collection migrations
@@ -233,7 +256,15 @@ Return ONLY the updated summary text."""
         self._setup_qdrant()
 
     def _setup_qdrant(self):
-        """Initialize Qdrant client if configured."""
+        """Initialize Qdrant client if configured.
+
+        Imports are inside the try because qdrant-client is optional in
+        requirements-local.txt (it currently lacks a Python 3.14 wheel).
+        A missing package is recorded separately from an initialization
+        failure so preflight can skip memory in development but still fail a
+        production deployment whose requirements.txt should include it.
+        """
+        self._qdrant_import_error = None
         if settings.qdrant_url:
             try:
                 from qdrant_client import QdrantClient
@@ -243,10 +274,15 @@ Return ONLY the updated summary text."""
                 client_kwargs["check_compatibility"] = False
                 self._qdrant_client = QdrantClient(**client_kwargs)
                 self._qdrant_ready = True
+            except ImportError as e:
+                # Optional local dependency — recorded for preflight's
+                # environment-aware decision.
+                self._qdrant_import_error = str(e) or type(e).__name__
+                self._qdrant_ready = False
             except Exception:
                 self._qdrant_ready = False
 
-    async def _ensure_collection(self, vector_size: int = 768):
+    async def _ensure_collection(self, vector_size: Optional[int] = None):
         """Create the Qdrant collection if missing; additively migrate it for
         hybrid search (Step 6B) without touching existing dense vectors.
 
@@ -254,13 +290,22 @@ Return ONLY the updated summary text."""
         stay valid. The BM25 sparse field is added alongside via
         update_collection — purely additive. Anything unsupported by the
         server degrades to dense-only (_hybrid_ready stays False).
+
+        Args:
+            vector_size: Dense dimension to create. Defaults to
+                settings.embedding_dimension so schema and gateway agree.
         """
         if not self._qdrant_ready:
             return
+        resolved_size = (
+            vector_size
+            if vector_size is not None
+            else settings.embedding_dimension
+        )
         async with self._ensure_lock:
-            await self._ensure_collection_inner(vector_size)
+            await self._ensure_collection_inner(resolved_size)
 
-    async def _ensure_collection_inner(self, vector_size: int = 768):
+    async def _ensure_collection_inner(self, vector_size: int):
         """Collection setup + hybrid migration (runs under _ensure_lock)."""
         from qdrant_client.models import (
             Distance, VectorParams, SparseVectorParams,
@@ -440,6 +485,119 @@ Return ONLY the updated summary text."""
             pass
 
     # ─── Public API ───────────────────────────────────────────────────────────
+
+    @property
+    def collection_name(self) -> str:
+        """Read-only collection name for diagnostics and preflight logging."""
+        return self._collection_name
+
+    async def preflight(self) -> Dict[str, Any]:
+        """
+        Verify Qdrant is reachable and the memory collection matches config.
+
+        Called once from the application lifespan before Telegram starts.
+        Returns a small status dict on success. Raises RuntimeError when
+        Qdrant is configured but unusable: silently degrading semantic memory
+        is exactly the production failure this check exists to catch.
+
+        When ``QDRANT_URL`` is empty the check is skipped and ``skipped`` is
+        True. Semantic memory is optional, so local/offline deployments must
+        still be able to start.
+
+        Why create the collection here:
+            The normal write path creates the collection lazily. Running the
+            same setup during preflight gives a fresh deployment a known-good
+            schema before the first user writes a memory, instead of failing
+            later in a background task where the error is easy to miss.
+        """
+        if not settings.qdrant_url:
+            return {
+                "skipped": True,
+                "reason": "QDRANT_URL is not configured",
+            }
+
+        # _setup_qdrant intentionally swallows initialization errors so the
+        # runtime can degrade gracefully. Preflight must surface them.
+        if not self._qdrant_client or not self._qdrant_ready:
+            self._setup_qdrant()
+        if not self._qdrant_client or not self._qdrant_ready:
+            if self._qdrant_import_error and not settings.is_production:
+                # requirements-local.txt deliberately omits qdrant-client.
+                # Local dev should still run; a production deploy missing a
+                # pinned dependency is a real failure.
+                return {
+                    "skipped": True,
+                    "reason": (
+                        "qdrant-client is not installed — semantic memory is "
+                        "disabled in this environment"
+                    ),
+                }
+            raise RuntimeError(
+                "Qdrant client could not be initialized — check QDRANT_URL "
+                "and QDRANT_API_KEY."
+            )
+
+        # Probe first. Only create when the collection is genuinely absent:
+        # running the legacy hybrid migration during startup would make a
+        # health check capable of rewriting data. The normal write path still
+        # migrates later, where a failure is contained to memory storage.
+        try:
+            info = await asyncio.to_thread(
+                self._qdrant_client.get_collection, self._collection_name
+            )
+        except Exception:
+            info = None
+
+        if info is None:
+            await self._ensure_collection(settings.embedding_dimension)
+            # Re-probe even if _ensure_collection reported failure: another
+            # replica may have created the collection between our probe and
+            # create, which is a benign race.
+            try:
+                info = await asyncio.to_thread(
+                    self._qdrant_client.get_collection, self._collection_name
+                )
+            except Exception as e:
+                self._qdrant_ready = False
+                raise RuntimeError(
+                    f"Qdrant collection '{self._collection_name}' is missing "
+                    "and could not be created."
+                ) from e
+            # The client is demonstrably reachable even if the create call
+            # lost a race, so keep runtime memory storage enabled.
+            self._qdrant_ready = True
+
+        params = getattr(getattr(info, "config", None), "params", None)
+        actual_dimension = _vector_size(getattr(params, "vectors", None))
+        if actual_dimension is None:
+            raise RuntimeError(
+                f"Qdrant collection '{self._collection_name}' has no readable "
+                "dense vector configuration."
+            )
+        if actual_dimension != settings.embedding_dimension:
+            raise RuntimeError(
+                f"Qdrant collection '{self._collection_name}' dimension "
+                f"mismatch: expected {settings.embedding_dimension}, got "
+                f"{actual_dimension}. Re-embed with the configured model or "
+                "point QDRANT_COLLECTION_NAME at the correct collection."
+            )
+
+        sparse_config = getattr(params, "sparse_vectors", None) or {}
+        hybrid_ready = SPARSE_FIELD in sparse_config
+        if not hybrid_ready:
+            logger.warning(
+                "Qdrant collection '%s' has no '%s' sparse vector — hybrid "
+                "search will fall back to dense-only.",
+                self._collection_name,
+                SPARSE_FIELD,
+            )
+
+        return {
+            "skipped": False,
+            "collection": self._collection_name,
+            "dimension": actual_dimension,
+            "hybrid_ready": hybrid_ready,
+        }
 
     @_timed("memory_write", _extract_extra)
     async def extract_and_store(

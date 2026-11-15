@@ -11,7 +11,7 @@ new dependency is introduced.
 """
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -20,6 +20,51 @@ logger = logging.getLogger("finbot")
 _fernet: Fernet = None
 _fernet_prev: Fernet | None = None
 _ephemeral_warned = False
+
+
+def validate_token_encryption_key(key: Optional[str] = None) -> None:
+    """
+    Validate that a Fernet key is present when required and well formed.
+
+    Startup preflight calls this before the bot accepts traffic so a bad
+    ``TOKEN_ENCRYPTION_KEY`` fails immediately instead of surfacing later as
+    an "unable to decrypt stored token" error. The key itself is never
+    logged or included in exception text.
+
+    Behavior:
+      * Production + empty key -> RuntimeError (tokens must be encrypted).
+      * Development + empty key -> returns quietly; the caller may use an
+        ephemeral key for the lifetime of the process.
+      * Non-empty key -> must parse as a valid Fernet key, else RuntimeError.
+
+    Args:
+        key: Optional key to validate. Defaults to the configured
+            ``TOKEN_ENCRYPTION_KEY``. Accepting an explicit value keeps the
+            validator directly testable without mutating global settings.
+    """
+    from config import settings
+
+    candidate = (key if key is not None else settings.token_encryption_key).strip()
+    if not candidate:
+        if settings.is_production:
+            raise RuntimeError(
+                "TOKEN_ENCRYPTION_KEY is required in production — OAuth tokens "
+                "cannot be stored unencrypted. Generate one with: "
+                "python -c \"from cryptography.fernet import Fernet; "
+                "print(Fernet.generate_key().decode())\""
+            )
+        return
+
+    try:
+        # Fernet validates the base64 encoding and the 32-byte payload length.
+        Fernet(candidate.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as e:
+        raise RuntimeError(
+            "TOKEN_ENCRYPTION_KEY is invalid — it must be a base64-encoded "
+            "32-byte Fernet key. Generate one with: "
+            "python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\""
+        ) from e
 
 
 def _get_fernet() -> Fernet:
@@ -33,11 +78,9 @@ def _get_fernet() -> Fernet:
 
     key = settings.token_encryption_key.strip()
     if not key:
-        if settings.is_production:
-            raise RuntimeError(
-                "TOKEN_ENCRYPTION_KEY is required in production — OAuth tokens "
-                "cannot be stored unencrypted."
-            )
+        # Validate first: in production this raises instead of silently
+        # generating an ephemeral key that would lose tokens on restart.
+        validate_token_encryption_key("")
         if not _ephemeral_warned:
             logger.warning(
                 "TOKEN_ENCRYPTION_KEY not set — using an ephemeral key for this "
@@ -46,14 +89,10 @@ def _get_fernet() -> Fernet:
             )
             _ephemeral_warned = True
         key = Fernet.generate_key().decode("ascii")
+    else:
+        validate_token_encryption_key(key)
 
-    try:
-        _fernet = Fernet(key.encode("ascii"))
-    except ValueError as e:
-        raise RuntimeError(
-            "TOKEN_ENCRYPTION_KEY is invalid — must be a base64-encoded 32-byte "
-            "key (see SECURITY_AUDIT.md)."
-        ) from e
+    _fernet = Fernet(key.encode("ascii"))
     return _fernet
 
 

@@ -174,43 +174,31 @@ async def get_email_count(token_data: Dict, query: str) -> int:
         return 0
 
 
+# Fernet tokens always begin with the base64url encoding of the version
+# byte (0x80), which is "gAAAAA". Used to distinguish a real encrypted
+# blob from a legacy raw token string without trying to guess lengths.
+_FERNET_TOKEN_PREFIX = "gAAAAA"
+
+
 async def revoke_google_token(token_data) -> bool:
     """
     Revoke a Google OAuth token server-side (OWASP A01 - proper session termination).
-    Called on /disconnect before deleting the stored blob.
-    Returns True if revoke was attempted (even if token already invalid).
-    Best-effort — failure is logged but doesn't block local disconnect.
+
+    Called before deleting a stored credential blob. Delegates token
+    selection to :func:`extract_raw_token` so every revocation path uses the
+    same preference order (refresh token first) and cannot drift apart.
+
+    Returns True when Google accepted the revocation or reported the token
+    as already invalid. Returns False for missing/unreadable credentials and
+    network/server failures. Best-effort: failure is logged but does not
+    block the caller from clearing local state.
     """
-    # Extract raw token string (access or refresh) — either revokes the grant
-    raw = None
+    raw_token = extract_raw_token(token_data)
+    if not raw_token:
+        return False
     try:
-        if isinstance(token_data, str):
-            from security.token_crypto import decrypt_token_blob
-            try:
-                token_data = decrypt_token_blob(token_data)
-            except Exception:
-                # If it's already a string token (legacy), try as-is
-                pass
-        if isinstance(token_data, dict):
-            raw = token_data.get("token") or token_data.get("refresh_token")
-        elif isinstance(token_data, str):
-            raw = token_data
-        if not raw:
-            return False
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            # Google revocation endpoint accepts either access or refresh token
-            r = await client.post(
-                "https://oauth2.googleapis.com/revoke",
-                data={"token": raw},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            # 200 = revoked, 400 = already invalid/expired — both mean "not usable anymore"
-            if r.status_code in (200, 400):
-                logger.info("Google token revoke succeeded (status=%d)", r.status_code)
-                return True
-            logger.warning("Google token revoke unexpected status=%d", r.status_code)
-            return False
+        await revoke(raw_token)
+        return True
     except Exception as e:
         logger.warning("Google token revoke failed: %s", type(e).__name__)
         return False
@@ -218,38 +206,92 @@ async def revoke_google_token(token_data) -> bool:
 
 def extract_raw_token(token_data) -> Optional[str]:
     """
-    Extract a raw OAuth token string (access or refresh) from stored data.
-    Accepts a Fernet-encrypted blob, a plaintext dict, or a raw string.
-    Returns None when no usable token is present. Never logs the token.
+    Extract the best available OAuth token from stored credential data
+    for use in server-side revocation.
+
+    Preference order:
+      1. ``refresh_token`` — preferred because revoking it invalidates all
+         associated access tokens regardless of their expiry state.
+      2. ``token`` / ``access_token`` — fallback if no refresh token is
+         stored. Only valid if not yet expired (approximately one hour).
+
+    Accepts:
+      - Fernet-encrypted blob (str) — decrypted before extraction
+      - Plain dict with ``refresh_token``, ``token``, or ``access_token``
+      - Raw token string — returned as-is
+
+    Returns None when no usable token can be extracted. If a value looks
+    like a Fernet blob but cannot be decrypted (wrong key or corrupt data),
+    None is returned instead of the ciphertext: passing ciphertext to
+    Google would produce a misleading "already invalid" response and hide
+    a real key-rotation problem from operators.
+
+    Never logs token values.
+
+    Args:
+        token_data: Stored credential data in any supported format.
+
+    Returns:
+        Raw token string suitable for passing to :func:`revoke`, or None if
+        no token is available.
     """
     try:
         if isinstance(token_data, str):
-            from security.token_crypto import decrypt_token_blob
             try:
+                from security.token_crypto import decrypt_token_blob
                 token_data = decrypt_token_blob(token_data)
             except Exception:
-                # Not an encrypted blob — treat as a raw token string.
-                pass
+                if token_data.startswith(_FERNET_TOKEN_PREFIX):
+                    logger.warning(
+                        "Stored OAuth token could not be decrypted — "
+                        "skipping server-side revocation."
+                    )
+                    return None
+                # Not an encrypted blob — legacy raw token string.
+
         if isinstance(token_data, dict):
-            return token_data.get("token") or token_data.get("refresh_token") or None
-        elif isinstance(token_data, str):
+            return (
+                token_data.get("refresh_token")
+                or token_data.get("token")
+                or token_data.get("access_token")
+                or None
+            )
+
+        if isinstance(token_data, str):
             return token_data or None
+
         return None
     except Exception:
+        # Swallow all exceptions — callers treat None as "no token" and
+        # handle the no-revocation path gracefully.
         return None
 
 
 async def revoke(token: str) -> None:
-    """Revoke a raw Google OAuth token server-side. Raises on failure."""
+    """
+    Revoke a raw Google OAuth token server-side.
+
+    The token is sent in the request body, never in the URL: query strings
+    are commonly captured by proxies and access logs. The response body is
+    deliberately never included in the exception for the same reason.
+
+    Google returns 200 for a successful revocation and 400 when the token
+    is already invalid, expired, or was previously revoked. Both outcomes
+    mean the credential is no longer usable, so both are treated as
+    success. Any other status is an operational failure and raises.
+    """
     import httpx
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(
             "https://oauth2.googleapis.com/revoke",
-            params={"token": token},
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            data={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        if response.status_code != 200:
-            raise Exception(
-                f"Google revocation returned {response.status_code}: "
-                f"{response.text}"
-            )
+        if response.status_code in (200, 400):
+            if response.status_code == 400:
+                logger.info("Google token was already invalid (status=400)")
+            return
+        raise Exception(
+            f"Google revocation returned unexpected status "
+            f"{response.status_code}"
+        )
